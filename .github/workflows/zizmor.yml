@@ -1,0 +1,61 @@
+name: zizmor
+
+# Static analysis of the GitHub Actions workflows themselves — template injection, over-broad
+# GITHUB_TOKEN permissions, credential persistence, dangerous pull_request_target, artifact
+# poisoning. This is the class of workflow-level security regression that SHA-pinning alone
+# does not catch: a bad `permissions:` block or an injectable `run:` expansion can land in a
+# pinned-actions workflow without any dependency changing.
+#
+# Posture: WARN-FIRST. The scan step is non-blocking (continue-on-error) so a new finding shows
+# up in the run logs / annotations without failing the PR. Add any reviewed low-confidence
+# suppressions to a new .github/zizmor.yml. Promoting this to a required gate is a one-line
+# change — drop `continue-on-error` — once maintainers are ready.
+#
+# CRITICAL, do not remove: this workflow is path-filtered (`paths:` below) and MUST NEVER be
+# added to branch protection's required-checks list while it stays path-filtered and has no
+# `merge_group` trigger. A required workflow that doesn't run on every event leaves every
+# merge-queue entry pending forever. Promoting this later means adding a bare `merge_group:`
+# trigger alongside the filtered `pull_request:` one — not just deleting `continue-on-error`.
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+      - ".github/zizmor.yml"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+      - ".github/zizmor.yml"
+
+concurrency:
+  group: zizmor-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only: the scan never needs to write. (This block also keeps zizmor from flagging *this*
+# workflow for excessive permissions.)
+permissions:
+  contents: read
+
+jobs:
+  zizmor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          python-version: "3.13"
+
+      # Pinned to an exact version so the baseline is reproducible; bump deliberately (a newer
+      # zizmor may surface new findings). GH_TOKEN lets the online audits (e.g.
+      # known-vulnerable-actions) resolve advisories.
+      - name: Run zizmor
+        continue-on-error: true # warn-first — see header comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: uvx zizmor@1.28.0 .github/workflows/

@@ -1,0 +1,99 @@
+name: CI
+
+# Format, lint, type-check and test the CLI; lint the markdown. Everything here needs no
+# network access to a Pepper server: the tests mock the HTTP layer.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # Required by the merge queue, and load-bearing: the queue holds a PR until its required
+  # checks report against the *speculative merge* it builds, so a required workflow that never
+  # runs on `merge_group` leaves every entry pending forever. There is deliberately no `paths:`
+  # filter anywhere in this file — `merge_group` does not support one, and a required workflow
+  # that path-filters itself out of a queue run has the same effect.
+  merge_group:
+
+concurrency:
+  # `github.ref` is the queue's own ref for a merge_group run
+  # (`refs/heads/gh-readonly-queue/main/pr-N-<sha>`), unique per entry, so cancel-in-progress
+  # cannot cancel a sibling entry's checks out from under it — a cancelled check is an eviction
+  # from the queue.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege default: the jobs here only read the checkout.
+permissions:
+  contents: read
+
+jobs:
+  # The repo profile's `python-service` required checks are `ci` and `docs`. Required checks are
+  # named per JOB, not per workflow, so these job keys are exactly the check-run names branch
+  # protection must list.
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          python-version: "3.13"
+
+      # --frozen: fail rather than silently resolving a different dependency set than uv.lock
+      # records. --extra dev pulls pytest, pytest-httpx, pytest-cov, ruff and ty.
+      - name: Install dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: Format check (ruff format)
+        run: uv run --no-sync ruff format --check
+
+      - name: Lint (ruff check)
+        run: uv run --no-sync ruff check
+
+      - name: Type check (ty)
+        run: uv run --no-sync ty check src/pepper_cli/
+
+      # `commands.coverage` from .claude/maintainerd.json. Running the suite under coverage is
+      # also how the suite runs at all — there is no separate test step, so a test failure fails
+      # here rather than being masked by the gate below.
+      - name: Test and measure coverage
+        run: uv run --no-sync pytest --cov --cov-report=json:coverage-summary.json
+
+      # coverage.py's JSON is not the summary contract; the adapter rewrites it to
+      # {"metric": "lines", "percent": N}. Vendored under .claude/maintainerd/ so CI runs it
+      # without the plugin installed.
+      - name: Normalize the coverage summary
+        run: .claude/maintainerd/coverage-adapt.sh --tool pytest-cov
+
+      # Before the gate, so a regression still publishes the number that proves it. The artifact
+      # name is load-bearing: the maintainerd doctor looks for exactly this.
+      - name: Upload the coverage summary
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage
+          path: coverage-summary.json
+          if-no-files-found: error
+          retention-days: 30
+
+      # The ratchet. Reads coverage.floor from .claude/maintainerd.json — one number, in a
+      # tracked file, so lowering it is a reviewable diff.
+      - name: Coverage ratchet
+        run: .claude/maintainerd/coverage-check.sh
+
+  # Markdown lint over the whole tree. Config, and the reason each rule is off, are in
+  # .markdownlint-cli2.jsonc.
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Lint markdown
+        run: npx --yes markdownlint-cli2@0.18.1

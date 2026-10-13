@@ -1,0 +1,35 @@
+version: 2
+
+# Ecosystems come from the repo profile (Vycari/vycari,
+# plugins/vycari-ops/references/repo-profile.json -> languages.python-service.dependabot),
+# minus `docker`: this repo has no Dockerfile.
+#
+# `uv`, not `pip`: this repo's dependency truth is uv.lock, and the pip ecosystem does not
+# regenerate it.
+updates:
+  # Python dependencies (pyproject.toml + uv.lock).
+  #
+  # Patch and minor are batched into one PR each; majors are deliberately ungrouped so each
+  # arrives as its own revertable PR. Batching matters because every bump regenerates uv.lock,
+  # and separate lock regenerations conflict with each other in the merge queue.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      python-patch:
+        update-types: ["patch"]
+      python-minor:
+        update-types: ["minor"]
+
+  # GitHub Actions used in .github/workflows. Grouped across update types: an Actions bump that
+  # breaks fails loudly in CI rather than subtly at runtime, so the batch is cheap to bisect.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns: ["*"]
