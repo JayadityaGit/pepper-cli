@@ -1049,7 +1049,7 @@ def test_trajectory_show_prints_events(tmp_home: Path, patch_api, capsys) -> Non
     # Header line carries the trajectory id and channel.
     assert _VALID_TRAJ_ID in out
     assert "client_api" in out
-    # Code SHA truncated to 12 chars (matches fetch-trajectory.sh).
+    # Code SHA truncated to 12 chars.
     assert "abcdef123456" in out
     # One line per event, in seq order.
     assert "[0] user_message" in out

@@ -206,17 +206,16 @@ def render_tool_result(payload: dict[str, Any]) -> None:
 
 
 #: Per-event payload preview budget for ``pepper trajectory show``.
-#: Matches the bash-script fallback in ``access-trajectory`` so the
-#: rendered view doesn't shift visibly when the skill prefers the CLI.
+#: Part of the rendered shape below, so changing it changes what
+#: parsers of that output see.
 _TRAJECTORY_EVENT_PREVIEW_CHARS = 300
 
 
 def render_trajectory(detail: TrajectoryDetail) -> None:
     """Pretty-print a trajectory + its events to stdout.
 
-    Output shape matches ``fetch-trajectory.sh`` so the
-    access-trajectory skill can read either source without
-    branching its parsing rules:
+    The output shape is kept stable, because agents and scripts
+    parse it:
 
         trajectory <id> — user <user_id> — channel <channel>
         conversation <key>                (when the turn carries one)
@@ -901,8 +900,8 @@ def _format_due(iso: str, date_only: bool | None = None) -> str:
 def _short_json(value: Any, budget: int) -> str:
     """JSON-serialize ``value`` and truncate to ``budget`` chars.
 
-    Mirrors ``payload | tostring | .[0:300]`` from
-    ``fetch-trajectory.sh``. ``default=str`` rather than raising on
+    The equivalent of jq's ``payload | tostring | .[0:budget]``.
+    ``default=str`` rather than raising on
     a non-serializable value: a payload dict from the server is JSON
     by definition, but defensiveness here costs nothing and keeps
     the renderer from dying mid-event if a future field slips

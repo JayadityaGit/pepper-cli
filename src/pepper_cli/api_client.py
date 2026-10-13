@@ -346,8 +346,8 @@ class TrajectoryRef:
 class TrajectoryEvent:
     """One row from ``trajectory_events``.
 
-    ``payload`` is opaque — its shape varies per ``event_type`` (see
-    the access-trajectory skill). The CLI doesn't try to type it.
+    ``payload`` is opaque — its shape varies per ``event_type``, and
+    the CLI doesn't try to type it.
     """
 
     id: str
@@ -1101,7 +1101,7 @@ class ApiClient:
     Constructed once per CLI invocation. Holds a single
     ``httpx.Client`` so connection reuse + TLS session caching
     work — matters less for the one-shot ``pepper chat`` path and
-    more for the REPL that lands in PR 5.
+    more for the REPL, which sends many turns over one client.
 
     Use as a context manager (``with ApiClient(...) as api:``) so the
     underlying httpx client closes deterministically; the CLI's
@@ -1615,8 +1615,7 @@ class ApiClient:
         Visibility is scoped to the calling user's principal — own
         trajectories plus group ones — and 404s otherwise. The CLI's
         ``pepper trajectory show`` command surfaces that as "not found,
-        or not yours"; the access-trajectory skill falls back to the
-        service-token script for the latter case.
+        or not yours".
         """
         return _trajectory_detail_from_dict(self.trajectory_get_raw(trajectory_id))
 

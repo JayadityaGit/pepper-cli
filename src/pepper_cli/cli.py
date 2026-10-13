@@ -14,7 +14,8 @@ Subcommands:
   ``GET /api/v1/groups`` instead, since it is not a Pepper account.
 - ``pepper whoami`` — print the user behind the current credentials.
 - ``pepper chat MESSAGE`` — one-shot turn against the server, render
-  the reply. PR 5 adds an interactive REPL and SSE streaming.
+  the reply. ``pepper chat`` with no message (or bare ``pepper``) opens
+  the interactive REPL, which streams each turn over SSE.
 - ``pepper trajectory show <id> | list`` — inspect saved turns.
 - ``pepper calendar [today|week|schedule] [--planning]`` — read-only agenda.
 - ``pepper next [--room R] [--first K] [--all] [--json]`` — Now / Do next / Due soon / Later.
@@ -1887,11 +1888,10 @@ def _serve_client_tool_call(
 def cmd_trajectory_show(args: argparse.Namespace) -> int:
     """``pepper trajectory show <id> [--json]``.
 
-    Default mode prints the same one-line-per-event view that the
-    bundled ``fetch-trajectory.sh`` script does, so the
-    access-trajectory skill can stay output-shape-agnostic between
-    the two paths. ``--json`` dumps the raw body to stdout for
-    ``jq``-able re-querying.
+    Default mode prints a header and then one line per event (see
+    :func:`render.render_trajectory` for the exact shape, which is kept
+    stable for tools that parse it). ``--json`` dumps the raw body to
+    stdout for ``jq``-able re-querying.
 
     Exit codes:
       0 — success
@@ -1902,8 +1902,7 @@ def cmd_trajectory_show(args: argparse.Namespace) -> int:
     import sys
 
     # Validate the UUID shape locally before splatting it into a URL —
-    # mirrors ``fetch-trajectory.sh`` and gives a friendlier error than
-    # the server's 422.
+    # gives a friendlier error than the server's 422.
     if not re.fullmatch(
         r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
         args.trajectory_id,
