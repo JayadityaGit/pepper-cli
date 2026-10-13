@@ -6,8 +6,15 @@ It authenticates with a **personal access token (PAT)** scoped to your own
 user — it never sees your Google credentials and never acts as anyone else.
 
 It depends only on `httpx`, `rich`, and `prompt_toolkit` (no dependency on
-the Pepper server package), so this directory doubles as the wire-contract
-reference for any future mobile/native client.
+the Pepper server package).
+
+The package is published as `vycari-pepper`; the command it installs is `pepper`.
+It is licensed under Apache-2.0 (see `LICENSE`).
+
+> [!NOTE]
+> The `/api/v1` API this client talks to is supported for Vycari's own clients.
+> Third-party clients that use a PAT against it do so at their own risk: there is
+> no stability promise beyond what this client needs.
 
 ---
 
@@ -31,17 +38,30 @@ There are two ways to get a `pepper` command, depending on what you're doing.
 ### Daily use — install it on your `PATH`
 
 ```bash
-uv tool install --from git+https://github.com/Vycari/pepper#subdirectory=clients/pepper-cli pepper-cli
+uv tool install --from git+https://github.com/Vycari/pepper-cli vycari-pepper
 ```
 
 This puts a `pepper` executable on your `PATH` (typically `~/.local/bin/pepper`).
+Installing from PyPI will replace the git URL once the package is published there.
+
+> [!NOTE]
+> **Upgrading from the old `pepper-cli` install.** Earlier versions were installed
+> from a subdirectory of the main Pepper repository under the name `pepper-cli`.
+> Remove that install once, then install as above:
+> ```bash
+> uv tool uninstall pepper-cli
+> ```
+> Your credentials file (`~/.config/pepper/credentials.toml`) is unchanged and is
+> shared by the new install.
+
+Keep in mind:
 
 > [!IMPORTANT]
 > **This is a *snapshot* pinned to the commit it was built from — it does not
 > auto-update.** After the CLI changes upstream (e.g. a new subcommand lands),
 > refresh it:
 > ```bash
-> uv tool upgrade pepper-cli
+> uv tool upgrade vycari-pepper
 > ```
 > If you skip this, the old binary won't have the new subcommand — and because
 > bare `pepper <args>` is shorthand for `pepper chat`, an unrecognized command
@@ -62,10 +82,10 @@ any first word that isn't a command exits 2. `pepper chat ...` and bare `pepper`
 ### Working in this repo — always run the source
 
 To run the version in your current checkout (no install, no staleness), use
-`uv run` against the workspace member:
+`uv run`:
 
 ```bash
-uv run --project clients/pepper-cli pepper --help
+uv run pepper --help
 ```
 
 This builds from the working tree every time and shares the same credentials
@@ -154,7 +174,7 @@ pepper whoami
 | `pepper skills list\|show <name> [--room R]` | Your skill library (yours, then the built-ins), or the skills shared with a room with `--room`. `show` prints SKILL.md. |
 | `pepper skills new\|edit\|delete <name>` | Author one of your own skills in `$EDITOR`, or delete it. Never takes `--room`. |
 | `pepper skills share\|revoke <name> --room R` | Share one of your skills with a room, or stop sharing one there. |
-| `pepper next [--room R] [--first urgent|important|fast] [--all] [--json]` | What to do next: Now, a numbered Do next, Due soon (48h), Later. GETs only. |
+| `pepper next [--room R] [--first urgent\|important\|fast] [--all] [--json]` | What to do next: Now, a numbered Do next, Due soon (48h), Later. GETs only. |
 | `pepper todos list [--status S] [--room R] [--json]` | List your todos, or a room's with `--room`. |
 | `pepper todos add <title…> [--due D] [--room R]` | Add a todo. With `--room`: title and a `YYYY-MM-DD` due date only. |
 | `pepper todos done\|reopen <id> [--room R]` | Tick a todo as Schedule does (closes it in your or the room's list and releases the rest of its held time), or put it back. |
@@ -352,8 +372,8 @@ server's own fields; `note` is the plan summary, or the unranked notice on the f
 ## Troubleshooting
 
 - **A command seems to get sent to Pepper as chat** → your installed `pepper`
-  is stale and doesn't know the subcommand. Run `uv tool upgrade pepper-cli`
-  (or use `uv run --project clients/pepper-cli pepper …`).
+  is stale and doesn't know the subcommand. Run `uv tool upgrade vycari-pepper`
+  (or use `uv run pepper …` from a checkout).
 - **`401` / "log in again"** → token revoked or missing; re-run `pepper login`.
 - **"couldn't reach" / transport error** → check the `--server` URL and your
   connection.
@@ -363,11 +383,13 @@ server's own fields; `note` is the plan summary, or the unranked notice on the f
 ## Developing the CLI
 
 ```bash
-uv sync --all-packages            # installs server + CLI into the workspace venv
-uv run --project clients/pepper-cli pytest
-uv run --project clients/pepper-cli ruff format
-uv run --project clients/pepper-cli ruff check
+uv sync --extra dev
+uv run pytest
+uv run ruff format --check
+uv run ruff check
+uv run ty check src/pepper_cli/
 ```
 
-Design notes (PAT auth, the `/api/v1` surface, SSE framing, invariants) live in
-[`planning/remote-client-api.md`](../../planning/remote-client-api.md).
+The CLI mirrors the server's `/api/v1` response shapes (see the `# MIRROR:` comments
+in `src/pepper_cli/api_client.py`) and tolerates unknown fields and stream frames.
+`CLAUDE.md` describes the layout for contributors and coding agents.
