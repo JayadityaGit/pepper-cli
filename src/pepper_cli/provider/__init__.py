@@ -15,8 +15,8 @@ arguments this process validates, which is exactly the authority the user
 granted when they typed ``--root`` and no more.
 
 Which is why **no tool here takes a root, base path or scope argument**
-(the grant is whatever the user typed after ``--root``). The moment a root is a parameter, the grant moves to the
-server and that whole property is void.
+(the grant is whatever the user typed after ``--root``). The moment a root is
+a parameter, the grant moves to the server and that whole property is void.
 """
 
 from __future__ import annotations
