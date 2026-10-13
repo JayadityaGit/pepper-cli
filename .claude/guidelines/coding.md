@@ -9,6 +9,8 @@
 - Wire models mirror the server's `/api/v1` response shapes. Each mirrored model carries a
   `# MIRROR:` comment naming the server model it follows. Keep models tolerant: ignore unknown
   fields and unknown stream frame types rather than failing.
-- Output goes through `render.py`; commands do not `print` ad hoc (the `T201` ignore is for the
-  rendering layer only).
+- Formatted output goes through `render.py` and its rich consoles. Bare `print` is allowed in
+  `cli.py` only, for plain lines meant for pipes (a created id, `whoami` fields) and argv errors
+  on stderr; the `T201` ignore in `pyproject.toml` is scoped to that one file, so a `print`
+  anywhere else fails lint.
 - Keep the CLI dependency-light. A new runtime dependency needs a reason in the PR.

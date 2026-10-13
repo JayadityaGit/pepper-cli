@@ -143,8 +143,11 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# A terminal client prints — that's the interface, not a debug leftover.
-"src/pepper_cli/**" = ["T201"]
+# `cli.py` is the one module that calls bare `print`: plain, unstyled lines
+# meant for pipes (a created id, `whoami` fields) and argv errors on stderr.
+# Everything else writes through the rich consoles in `render.py`, which this
+# rule does not flag, so a `print` anywhere else still fails lint.
+"src/pepper_cli/cli.py" = ["T201"]
 # Tests assert, reach into internals, and use literal fixtures on purpose.
 # Entries here are only those NOT already in the global `ignore` above, so
 # every line is load-bearing.
