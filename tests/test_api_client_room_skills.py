@@ -1,4 +1,4 @@
-"""Tests for the ApiClient room-skill methods (pepper#4556).
+"""Tests for the ApiClient room-skill methods.
 
 Same ``httpx.MockTransport`` style as ``test_api_client_scheduled_tasks.py``:
 assert the wire shape (method, URL, body) and that a response parses into

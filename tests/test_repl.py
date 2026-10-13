@@ -48,7 +48,7 @@ class _FakeApi:
         self.server_url = server_url
         self.token = token
         self.messages: list[str] = []
-        # What ``--root`` declared on each turn, if anything (planning/client-tools.md).
+        # What ``--root`` declared on each turn, if anything.
         self.client_tools: list[list[dict] | None] = []
         self.stream_responses: list[Any] = []
         # ``list_skills`` returns whatever was pre-programmed; default
@@ -223,7 +223,7 @@ def test_stream_one_turn_renders_a_thought_as_one_line(
     logged_in, patch_api_factory, monkeypatch, capsys
 ) -> None:
     """A thought arrives as fragments plus a terminal block; it must render as
-    one line, not one line per fragment (#1396).
+    one line, not one line per fragment.
 
     ``model_thought`` frames are whatever the backend chunks at — a paragraph
     on Gemini, a single word on the OpenAI and Anthropic backends — so a line
@@ -274,7 +274,7 @@ def test_stream_one_turn_reprints_a_thought_a_retry_replaced(
     is authoritative and gets the last word.
 
     The abandoned attempt gets no terminating block by design (see
-    ``agent/generation.py::_consume_one_generation``), so its fragments and the
+    the server's generation loop), so its fragments and the
     retry's arrive as one unbroken run and the line reads as a partial thought
     welded to the real one. A terminal cannot un-write that, so the correct
     paragraph is printed after it rather than left implied.

@@ -1,11 +1,11 @@
 """Tiny ``SecretStr`` shim — same surface as ``pydantic.SecretStr`` but
 zero extra dependencies.
 
-The repo-wide rule in ``CLAUDE.md`` is "declare secrets with
+The project rule is "declare secrets with
 ``SecretStr`` and read with ``.get_secret_value()`` only at the use
-site." Server-side that's ``pydantic.SecretStr`` because pydantic is
-already a server dep. The CLI package is deliberately dep-light (see
-``clients/pepper-cli/pyproject.toml`` — only ``httpx`` + ``rich``), so
+site." On the server that's ``pydantic.SecretStr`` because pydantic is
+already a server dependency. The CLI package is deliberately dep-light (see
+``pyproject.toml`` — ``httpx``, ``rich`` and a few small libraries), so
 pulling in pydantic for a single type would bloat the wheel and the
 iOS/Android-port reference. This shim provides the same behavior in
 ~20 lines.

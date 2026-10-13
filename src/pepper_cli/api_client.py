@@ -13,8 +13,7 @@ Two design rules drove the shape:
    and keeps stack traces shallow when something fails.
 2. *Raise on error, return data on success.* Each method returns a
    plain Python dict matching the server's response JSON (the server-
-   side Pydantic models in ``src/pepper/gateway/channels/client_api/``
-   define the canonical schema). On a non-2xx response we raise
+   side Pydantic models define the canonical schema). On a non-2xx response we raise
    :class:`ApiError` with the status + body so the CLI can render
    useful messages without parsing twice.
 """
@@ -73,7 +72,7 @@ class ApiError(Exception):
 
 class ArtifactConflictError(ApiError):
     """A 412 from ``POST /api/v1/artifacts/{id}/edit`` — the ``If-Match``
-    the caller sent no longer matches (``planning/cli-artifacts.md`` §6):
+    the caller sent no longer matches:
     someone else's write landed first. A subclass of :class:`ApiError`
     rather than a distinct type so a caller that only wants the generic
     "server said no" handling still catches it; ``pepper notes edit``'s
@@ -124,7 +123,7 @@ class Whoami:
     #: chained). Always present; empty when this user was never a merge
     #: target.
     merged_from: list[str] = field(default_factory=list)
-    #: The account's date order and clock, normalized server-side (#2040).
+    #: The account's date order and clock, normalized server-side.
     #: Defaulted so a server older than the field still parses.
     date_format: str = "mdy"
     time_format: str = "12h"
@@ -285,7 +284,7 @@ class StreamEvent:
       backend, so this — not the shape of the fragments — is what closes a
       thought.
     - ``"retry_attempt"`` — the generation was abandoned by a transient
-      provider failure and is being re-run (#3185). No payload; drop the
+      provider failure and is being re-run. No payload; drop the
       thought accumulated so far, since the abandoned attempt sends no block.
     - ``"tool_call"`` — model invoked a tool. ``payload`` matches the
       server's ``_event_payload_for_sse`` output (``{"name", "args",
@@ -675,12 +674,10 @@ def device_poll(
 # ---------------------------------------------------------------------------
 # Groups
 #
-# MIRROR: src/pepper/api/groups.py, and through it
-# src/pepper/features/groups/contract.py — the one implementation both the
-# session door and this one call. Field changes on the server MUST land here
-# in the same PR: this package is the canonical reference a native port
-# reproduces, and a reference client one release behind stops being a
-# reference (planning/groups-on-ios.md, phase 1).
+# MIRROR: src/pepper/api/groups.py — the route module that the server's
+# other front doors share. Field changes on the server MUST be matched here:
+# this package is the canonical reference a native port reproduces, and a
+# reference client one release behind stops being a reference.
 #
 # Where a shape below is a plain ``dict`` rather than a dataclass, the
 # docstring says why. The rule is: anything a *caller* reads field by field
@@ -707,7 +704,7 @@ class GroupTopicSummary:
     archived_at: str | None = None
     imported_history: bool = False
     #: Whether this is the room's default topic — the one an unprompted post
-    #: lands in (``agent-members.md`` §3.5). Only the topic rail
+    #: lands in. Only the topic rail
     #: (``GET .../topics``) says so; the rooms list leaves it ``False``.
     is_default: bool = False
 
@@ -822,16 +819,15 @@ class GroupMessage:
     is_permalink_target: bool = False
     #: Structured ids alongside the display fields (``display_name``,
     #: ``mention_names``, ``quote``): the groups service's own ids for the
-    #: author, the mentioned persons, and the parent (#3801). A caller
-    #: deciding *who* wrote a message or *whom* it addresses — the
-    #: agent-member watcher (``Vycari/groups``
-    #: ``docs/design/agent-members.md`` §3.4) — needs ids, not names.
+    #: author, the mentioned persons, and the parent. A caller
+    #: deciding *who* wrote a message or *whom* it addresses — an
+    #: agent-member watcher, say — needs ids, not names.
     #: ``None``/``[]`` on rows from an older server that does not send them.
     #: Nothing in this package reads them.
     author_person_id: str | None = None
     mentions: list[str] = field(default_factory=list)
     parent_message_id: str | None = None
-    #: An agent member's post (``agent-members.md`` §3.6), and whom it was
+    #: An agent member's post, and whom it was
     #: answering — "*agent* · for *requester*". ``False``/``None`` on rows
     #: from an older server.
     is_agent: bool = False
@@ -863,11 +859,11 @@ class GroupRosterMember:
     display_name: str
     picture_url: str | None = None
     is_pepper: bool = False
-    #: An agent member (``agent-members.md`` §3.6), so ``groups roster``
+    #: An agent member, so ``groups roster``
     #: never presents one as a person.
     is_agent: bool = False
     #: The harness profile the adder picked for an agent member in this room
-    #: (``agent-members.md`` §3.7); ``None`` for a person and for Pepper.
+    #: ``None`` for a person and for Pepper.
     agent_profile: str | None = None
 
 
@@ -982,14 +978,14 @@ def _group_topic_from_dict(row: dict[str, Any]) -> GroupTopicSummary:
 # Artifacts / notes
 #
 # MIRROR: src/pepper/api/artifacts.py::ArtifactListItem / ArtifactListResponse
-# (``GET /api/v1/artifacts``) and src/pepper/agent/artifacts/applet.py::read_detail
+# (``GET /api/v1/artifacts``) and the server's artifact-detail reader
 # (``GET /api/v1/artifacts/{id}/detail``). The detail route answers a plain
 # ``JSONResponse``, not a declared Pydantic model, so :class:`ArtifactDetail`
 # below is a curated subset of that function's returned dict — the fields
 # ``pepper notes`` reads — rather than a field-for-field mirror. Field
-# changes to either MUST land here in the same PR.
+# changes to either MUST be matched here.
 #
-# ``pepper notes`` (planning/cli-artifacts.md) is the one caller today and
+# ``pepper notes`` is the one caller today and
 # always passes ``kind="inline_text"``, but these shapes are kind-agnostic
 # like the routes themselves — a future ``images``/``links`` surface would
 # read the same types.
@@ -1664,8 +1660,7 @@ class ApiClient:
     ) -> None:
         """``POST /api/v1/chat/tool-result`` — answer one ``client_tool_call``.
 
-        The uplink half of the client-tools round trip
-        (``planning/client-tools.md`` §2.2). Issued **while the SSE stream is
+        The uplink half of the client-tools round trip. Issued **while the SSE stream is
         still open**, on a second connection from the same pool: the chat
         request body closed before the turn started, so there is nowhere else
         for an answer to go.
@@ -1856,8 +1851,8 @@ class ApiClient:
     # ------------------------------------------------------------------
     # Groups (MIRROR: src/pepper/api/groups.py)
     #
-    # One method per row of ``planning/groups-on-ios.md``'s contract table,
-    # in the same order, so a port can walk the two side by side.
+    # One method per route of the groups API, so a native port can walk
+    # the two side by side.
 
     def list_groups(self, *, archived: bool = False) -> GroupList:
         """``GET /api/v1/groups`` — the caller's rooms, and the surface's
@@ -1945,7 +1940,7 @@ class ApiClient:
         token is still in ``message`` at send time.
 
         ``on_behalf_of_person_id`` names the person an agent member is
-        answering (``Vycari/groups`` ``docs/design/agent-members.md`` §3.6):
+        answering:
         the service shows the post as the agent's, "for" that person. Only an
         agent token may send it; Pepper refuses it from a signed-in person.
         """
@@ -2326,7 +2321,7 @@ class ApiClient:
         """``POST /api/v1/artifacts/new`` — save a new note.
 
         Hardcodes ``kind="inline_text"``: this wraps the notes write path
-        only (``planning/cli-artifacts.md`` phase 5), not the general
+        only, not the general
         artifact-creation route, which also takes links. ``principal``
         resolves the same as every other artifact call — omitted is
         self-access, a room name must be a group the caller belongs to or
@@ -2357,7 +2352,7 @@ class ApiClient:
         "Only what arrives is touched" (``ArtifactEditRequest``'s own
         contract, server-side): a ``None`` field here is left alone, so a
         caller that only renames sends no ``body``, and a caller whose text
-        is unchanged (``pepper notes edit``'s round trip, §6) sends no
+        is unchanged (``pepper notes edit``'s round trip) sends no
         ``body`` either, avoiding a spurious version row.
 
         ``if_match`` is the bare etag digest or ``None`` for last-write-wins

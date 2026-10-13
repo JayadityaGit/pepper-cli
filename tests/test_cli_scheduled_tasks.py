@@ -582,7 +582,7 @@ def test_scheduled_tasks_is_not_swallowed_by_implicit_chat(tmp_home, patch_api) 
 
 
 # ---------------------------------------------------------------------------
-# --room: a room's scheduled tasks (pepper#4311)
+# --room: a room's scheduled tasks
 #
 # Same commands, the room's routes. What matters on the wire is the same as
 # above — which path, which three-state delivery payload — plus the two

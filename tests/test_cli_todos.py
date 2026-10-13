@@ -37,8 +37,8 @@ def machine_zone(monkeypatch):
     restores the variable but not libc's cached zone, so the teardown
     ``tzset`` is what keeps this from leaking into a later test. Needed here
     because a UTC test machine can't tell "no zone conversion" from "zone
-    conversion that happens to land on the same UTC offset" — see #2477's
-    review, which is exactly this gap.
+    conversion that happens to land on the same UTC offset" — which is
+    exactly the gap this fixture closes.
     """
 
     def install(name: str) -> None:
@@ -201,7 +201,7 @@ def test_todos_list_without_credentials_errors(tmp_home, patch_api) -> None:
 
 
 # ---------------------------------------------------------------------------
-# render: due_is_date_only (#2477)
+# render: due_is_date_only
 
 
 def test_format_due_date_only_shows_the_bare_utc_day_with_no_clock(machine_zone) -> None:
@@ -209,7 +209,7 @@ def test_format_due_date_only_shows_the_bare_utc_day_with_no_clock(machine_zone)
     # midnight UTC as the *previous* evening if `.astimezone()` ran, so this
     # zone is the one that actually catches a regression — a UTC test
     # machine can't tell "no conversion" from "conversion that happens to
-    # land on the same day" (#2477's review).
+    # land on the same day".
     machine_zone("America/Los_Angeles")
     assert _format_due("2026-07-31T00:00:00Z", True) == "2026-07-31"
 
@@ -217,7 +217,7 @@ def test_format_due_date_only_shows_the_bare_utc_day_with_no_clock(machine_zone)
 def test_format_due_date_only_never_converts_to_the_local_zone(machine_zone) -> None:
     # Same instant, explicit offset spelling, same zone — still just the UTC
     # day. (`.astimezone()` is what would otherwise shift this to the wrong
-    # calendar day for a reader west of UTC — see #2477.)
+    # calendar day for a reader west of UTC.)
     machine_zone("America/Los_Angeles")
     assert _format_due("2026-07-31T00:00:00+00:00", True) == "2026-07-31"
 

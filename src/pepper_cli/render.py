@@ -114,7 +114,7 @@ def render_thought_delta(text: str, *, first: bool) -> None:
 
     A fragment is whatever the backend chunks at — a paragraph on Gemini, a
     token on OpenAI and Anthropic — so a line per fragment gives a column of
-    single words on the token-level backends (#1396). Fragments are written
+    single words on the token-level backends. Fragments are written
     without a newline instead, and :func:`end_thought` closes the line when the
     terminal ``model_thought_block`` says the thought ended. Nothing is
     buffered, so the text still appears at the backend's own pace.
@@ -146,8 +146,8 @@ def end_thought(text: str, *, streamed: str) -> None:
       dropped fragment. Print the block as its own line.
     - **What streamed is not this thought.** A transient provider failure
       mid-stream abandons its attempt *without* a terminating block (see
-      ``agent/generation.py::_consume_one_generation``); the server now sends
-      a ``retry_attempt`` frame for that (:func:`discard_thought`, #3185).
+      the server's generation loop); the server now sends
+      a ``retry_attempt`` frame for that (:func:`discard_thought`).
       Otherwise the block is authoritative — the same rule the web composer
       applies by rewriting the row — so print it on its own line rather than
       leaving stale text as the record. A terminal cannot un-write what it
@@ -165,7 +165,7 @@ def end_thought(text: str, *, streamed: str) -> None:
 
 
 def discard_thought() -> None:
-    """End the line a ``retry_attempt`` frame abandons (#3185).
+    """End the line a ``retry_attempt`` frame abandons.
 
     A terminal cannot un-write the abandoned fragments, so end their line and
     let the retry's fragments start a fresh ``·`` thought instead of fusing
@@ -792,7 +792,7 @@ def render_group_messages(page: GroupMessagePage) -> None:
             _stdout.print(f"[bold]{m.day_label}[/bold]")
             last_day_key = m.day_key
         display_name = escape(m.display_name)
-        # "*agent* · for *requester*" (agent-members §3.6) — on a deleted
+        # "*agent* · for *requester*" — on a deleted
         # post too, as the web's badge is: who wrote it doesn't change.
         agent_tag = ""
         if m.is_agent:

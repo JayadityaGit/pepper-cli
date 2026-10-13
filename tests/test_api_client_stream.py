@@ -305,7 +305,7 @@ def test_chat_send_stream_handles_error_frame() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Mid-stream retry (#3185): the retry_attempt frame
+# Mid-stream retry: the retry_attempt frame
 
 _REPLY_FRAME = _frame(
     "reply", '{"reply": "done", "user_message_id": "u", "assistant_message_id": "a"}'

@@ -41,16 +41,16 @@ Subcommands:
   unarchive-topic, new / rename / archive / unarchive / leave / mute /
   unmute, invite / remove / role, apps / install-app / uninstall-app,
   sharing, activity and search; the destructive ones confirm unless ``--yes``. Reference client for
-  ``planning/groups-on-ios.md`` — this is the surface a native port
+  the groups API — this is the surface a native port
   reproduces, so a shape change here mirrors the server contract, not the
   other way round.
 - ``pepper notes list | search | show | new | edit | rm`` — your text
   artifacts: your own, or a room's shared ones with ``--room``. Reference
-  client for ``planning/cli-artifacts.md`` — ``show`` writes a note's raw
+  client for the artifacts API — ``show`` writes a note's raw
   markdown body to stdout, byte-exact when piped, so ``show > f.md``
   round-trips through ``notes edit --file f.md``. ``new``/``edit`` take the
   body from ``$EDITOR``, ``--file PATH``, or ``--file -`` for stdin;
-  ``edit`` sends nothing when the text is unchanged and runs the §6
+  ``edit`` sends nothing when the text is unchanged and runs the
   conflict flow (save + diff + re-open/overwrite/quit) on a stale
   ``If-Match``. ``rm`` asks before deleting unless ``--yes``.
 - ``pepper takeout [--out FILE]`` — download a zip archive of everything
@@ -196,7 +196,7 @@ _NOTE_ARG_HELP = "Note name (case-insensitive, unique prefix OK) or its UUID."
 # value ``pepper notes`` restricts every list/search/show call to. This
 # package doesn't depend on pepper-server (see api_client.py's module
 # docstring), so the string is hardcoded rather than imported; a rename on
-# the server side MUST land here in the same PR.
+# the server side MUST be matched here.
 _NOTES_KIND = "inline_text"
 
 #: Cap passed to the server when resolving a ``<note>`` name to an id.
@@ -438,16 +438,15 @@ def _build_parser() -> tuple[argparse.ArgumentParser, frozenset[str]]:
         nargs="*",
         help="Message to send. Multi-word OK without quotes. Omit to open the interactive REPL.",
     )
-    # Client-provided tools (``planning/client-tools.md`` phase 1). Repeatable:
+    # Client-provided tools. Repeatable:
     # ``--root ~/notes --root ~/work``. Each one grants read-only access to
     # that folder **for the length of this invocation**, enforced here rather
-    # than on the server (§3) — the server never learns what a root is, and a
+    # than on the server — the server never learns what a root is, and a
     # tool takes no root argument, so the grant cannot be widened from the
-    # other end (invariant 1).
+    # other end.
     #
-    # ``--tools-root`` is the spelling ``planning/client-tools.md``'s phase
-    # table uses; §9 and the issue use ``--root``. Both work rather than
-    # picking one and stranding whoever read the other.
+    # ``--tools-root`` is an accepted alias for ``--root``: both work rather
+    # than picking one and stranding whoever read the other.
     p_chat.add_argument(
         "--root",
         "--tools-root",
@@ -1309,8 +1308,7 @@ def _login_manual(server_url: str, raw_token: str | None) -> int:
     return 0
 
 
-#: An agent member's token (``Vycari/groups`` ``docs/design/agent-members.md``
-#: §3.1). It authenticates as the agent, not a Pepper account, so it reaches
+#: An agent member's token. It authenticates as the agent, not a Pepper account, so it reaches
 #: only the room routes — ``whoami`` refuses it by design.
 AGENT_TOKEN_PREFIX = "pep_agt_"
 
@@ -1779,10 +1777,10 @@ def _stream_one_turn(
     # Thoughts arrive as fragments of any size followed by a terminal
     # ``model_thought_block``; the fragments stream onto one line and the block
     # ends it, so a thought reads as a paragraph on every backend rather than
-    # one word per line on the token-level ones (#1396).
+    # one word per line on the token-level ones.
     # What the fragments have put on screen for the thought still open, so the
     # block can tell whether the screen already holds it. ``retry_attempt``
-    # resets it, so it only holds the attempt a block will close (#3185).
+    # resets it, so it only holds the attempt a block will close.
     streamed = ""
     manifest = provider.manifest() if provider is not None else None
     for event in api.chat_send_stream(message, client_tools=manifest):
@@ -1798,7 +1796,7 @@ def _stream_one_turn(
             streamed = ""
         elif event.kind == "retry_attempt":
             # The abandoned attempt's fragments stay on screen; end their line
-            # so the retry's start fresh (#3185). The common retry lands before
+            # so the retry's start fresh. The common retry lands before
             # any fragment, and then there is no line to end.
             if trace and streamed:
                 render.discard_thought()
@@ -3711,7 +3709,7 @@ def cmd_groups_post(args: argparse.Namespace) -> int:
             render.error(f"{flag} cannot be empty")
             return 2
     # The service accepts a requester only on a reply whose parent the
-    # requester wrote (agent-members.md §3.6), so a bare --on-behalf-of is a
+    # requester wrote, so a bare --on-behalf-of is a
     # post it must reject — refuse it here, before any upload.
     if args.on_behalf_of is not None and args.reply_to is None:
         render.error("--on-behalf-of needs --reply-to (the requester's message)")
@@ -4146,7 +4144,7 @@ def cmd_groups_search(args: argparse.Namespace) -> int:
 def _report_notes_api_error(exc: api_client.ApiError) -> int:
     """Map an :class:`ApiError` from a notes/artifacts call to an exit code.
 
-    ``planning/cli-artifacts.md`` §5 pins two statuses to specific wording
+    Two statuses get specific wording
     distinct from :func:`_report_api_error`'s generic handling:
 
     - 404 — missing room, missing note, and "not a member" are one answer
@@ -4197,7 +4195,7 @@ def _resolve_note(
     :func:`_match_by_name` already treats more than one case-insensitive
     exact match as ambiguous rather than picking the first — load-bearing
     here, since artifact names are deliberately not unique
-    (``service.find_by_name``'s own docstring, #1271): two notes named
+    (the server's name lookup documents this): two notes named
     "Runbook" must not silently resolve to whichever the server listed
     first.
     """
@@ -4341,7 +4339,7 @@ def cmd_notes_show(args: argparse.Namespace) -> int:
 
 
 def _stdin_is_tty() -> bool:
-    """Wraps ``sys.stdin.isatty()`` so the §6 conflict prompt's branch is
+    """Wraps ``sys.stdin.isatty()`` so the conflict prompt's branch is
     monkeypatchable directly — pytest's own stdin capture isn't a TTY,
     same reasoning as ``window_title._stdout_is_tty``."""
     return sys.stdin.isatty()
@@ -4382,13 +4380,13 @@ def _texts_match(original: str, edited: str) -> bool:
     append a trailing newline on save, so a straight ``==`` would treat
     "opened the editor and changed nothing" as an edit and send a body
     differing from the stored one by whitespace alone, creating a spurious
-    version row for a no-op (§5: "send nothing if the text is unchanged").
+    version row for a no-op ("send nothing if the text is unchanged").
     """
     return edited == original or edited == original + "\n"
 
 
 def _note_slug(name: str) -> str:
-    """Filesystem-safe stem for the §6 conflict-save filename: lowercase,
+    """Filesystem-safe stem for the conflict-save filename: lowercase,
     every run of non-alphanumerics collapsed to one hyphen, trimmed. Good
     enough for a scratch file whose exact path the CLI prints back to the
     user — not a general-purpose slugify utility."""
@@ -4397,7 +4395,7 @@ def _note_slug(name: str) -> str:
 
 
 def _save_conflict_copy(name: str, etag: str | None, text: str) -> str | None:
-    """Write ``text`` to ``./<note-slug>.<short-etag>.mine.md`` (§6 step 1)
+    """Write ``text`` to ``./<note-slug>.<short-etag>.mine.md``
     and return the path. ``etag`` is the server's *current* one as of the
     conflict, not the stale one the CLI sent.
 
@@ -4455,8 +4453,8 @@ def _save_conflict_copy(name: str, etag: str | None, text: str) -> str | None:
 
 
 def _print_note_diff(current_body: str, mine: str) -> None:
-    """Unified diff from the server's current body to the user's text (§6
-    step 2), written straight to stderr rather than through
+    """Unified diff from the server's current body to the user's text,
+    written straight to stderr rather than through
     :func:`render.error` — a note's body can hold literal ``[``/``]``
     characters that Rich's markup parser would misread."""
     import difflib
@@ -4524,16 +4522,16 @@ def cmd_notes_edit(args: argparse.Namespace) -> int:
 
     Fetches the note's current detail first: it seeds ``$EDITOR`` with the
     current body (skipped when ``--file``/stdin supplies one directly) and
-    is the "fresh show" the default ``If-Match`` comes from (§5) — the same
+    is the "fresh show" the default ``If-Match`` comes from — the same
     read serves both, so ``--file`` gets a precondition just as current as
     the editor path's. Sends no ``body`` when the text is unchanged —
     byte-identical for ``--file``/stdin, or up to one trailing newline for
     ``$EDITOR`` (:func:`_texts_match`) — and sends nothing at all when no
-    ``--rename`` was given either (§5). An empty result aborts with exit 2,
+    ``--rename`` was given either. An empty result aborts with exit 2,
     matching the server's own blank-body refusal, before any network call.
 
     A stale ``If-Match`` raises :class:`api_client.ArtifactConflictError`
-    (412, §6): the user's text is saved to
+    (412): the user's text is saved to
     ``./<note-slug>.<short-etag>.mine.md``, a unified diff from the
     server's current body to that text is printed, and then — on a TTY —
     the user picks ``[r]e-open`` the editor (seeded with their own text,
@@ -4672,8 +4670,8 @@ def cmd_notes_rm(args: argparse.Namespace) -> int:
 
     Confirms before deleting unless ``--yes``. The delete itself
     (``POST /api/v1/apps/notes/actions/delete``) is a soft delete — any
-    room member may delete a room note (§4) — recorded with the acting
-    user; there is no ``pepper notes restore`` yet (§8), so this is the
+    room member may delete a room note — recorded with the acting
+    user; there is no ``pepper notes restore`` yet, so this is the
     only undo there is until the retention window closes.
 
     Reads the detail first, for the same kind check ``show``/``edit`` make:

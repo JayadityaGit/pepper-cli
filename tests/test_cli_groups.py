@@ -1189,7 +1189,7 @@ def test_groups_post_passes_on_behalf_of(tmp_home, patch_api) -> None:
 
 
 def test_groups_post_refuses_on_behalf_of_without_a_reply(tmp_home, patch_api) -> None:
-    """The requester must be the author of the parent message (§3.6), so a
+    """The requester must be the author of the parent message, so a
     bare ``--on-behalf-of`` is a post the service must reject — refused
     locally before anything is sent."""
     _login(tmp_home)

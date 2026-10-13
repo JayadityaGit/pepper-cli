@@ -1,4 +1,4 @@
-"""Tests for ``pepper skills … --room`` (pepper#4556).
+"""Tests for ``pepper skills … --room``.
 
 Same approach as ``test_cli_skills.py``: ``cli.main([...])`` against a fake
 ``ApiClient``. What these pin is what only a room has — a skill there is a

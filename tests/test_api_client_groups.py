@@ -211,8 +211,8 @@ def test_message_row_ids_parse_and_old_rows_without_them_default() -> None:
 
 
 def test_agent_rows_parse_and_old_rows_default_to_a_person() -> None:
-    """``is_agent`` / ``for_display_name`` ("*agent* · for *requester*",
-    agent-members §3.6) parse off a new server and default off an old one."""
+    """``is_agent`` / ``for_display_name`` ("*agent* · for *requester*")
+    parse off a new server and default off an old one."""
     agent = _message_json(is_agent=True, for_display_name="Ada")
 
     def handler(_request: httpx.Request) -> httpx.Response:

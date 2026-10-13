@@ -4,8 +4,8 @@ Same ``httpx.MockTransport`` style as ``test_api_client_groups.py``: assert
 the wire shape (method, URL, query, headers) and that responses parse into
 the dataclasses. Server-side behaviour (membership checks, the uniform 404,
 the 503 on an unreachable membership seam) is covered in the server's own
-``tests/api/test_artifacts*.py`` — what's pinned here is the client's shape
-of the contract, per ``planning/cli-artifacts.md``.
+test suite — what's pinned here is the client's shape
+of the contract.
 """
 
 from __future__ import annotations

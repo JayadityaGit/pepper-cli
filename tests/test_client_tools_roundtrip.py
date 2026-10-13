@@ -1,6 +1,6 @@
 """``pepper chat --root …`` end to end, against a fake server.
 
-Drives the whole client half of ``planning/client-tools.md`` §2.2 through
+Drives the whole client half of the client-tools round trip through
 ``httpx.MockTransport``: the manifest rides up on the chat request, a
 ``client_tool_call`` frame comes down the SSE stream, the CLI runs the tool
 locally and posts the answer to ``/api/v1/chat/tool-result`` **while the

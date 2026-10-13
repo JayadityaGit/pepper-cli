@@ -1,11 +1,11 @@
 """Read-only filesystem tools under one or more declared roots.
 
-Three tools, named exactly as ``planning/client-tools.md`` §9 names them:
+Three tools:
 
 - ``fs_list`` — the entries directly under a relative directory;
 - ``fs_read`` — one file's text, size-capped with a truncation marker;
 - ``fs_grep`` — a literal, case-insensitive search **run here**, returning
-  bounded snippets rather than whole files (D6(a): the search happens on the
+  bounded snippets rather than whole files (the search happens on the
   device, so what crosses the wire is strictly less than the file).
 
 Paths are relative to a declared root and are re-resolved with the OS's own
@@ -39,7 +39,7 @@ MAX_READ_BYTES = 200_000
 MAX_LIST_ENTRIES = 500
 
 #: Matches one ``fs_grep`` returns, and the characters of context around
-#: each. Both are the "bounded snippets" half of D6(a).
+#: each. Both bound the snippets ``fs_grep`` returns.
 MAX_GREP_MATCHES = 40
 GREP_SNIPPET_CHARS = 240
 
@@ -175,12 +175,12 @@ class FilesystemProvider:
 
         ``readOnlyHint`` is ``True`` on all three and is the truth: nothing
         in this module opens a file for writing. The server would drop a
-        tool without it anyway (phase 1 declares no writes), which is the
+        tool without it anyway (no write tools are declared), which is the
         conservative default working in the right direction.
 
         The root *names* appear in the descriptions so the model can say
         "your notes folder" — a label, never a path, and never something the
-        server may treat as a guarantee (invariant 2).
+        server may treat as a guarantee.
         """
         where = ", ".join(r.label for r in self._roots)
         return [

@@ -1,5 +1,5 @@
-"""End-to-end tests for the ``pepper notes`` subcommands (planning/cli-artifacts.md
-phase 4 — the read side: ``list``/``search``/``show``).
+"""End-to-end tests for the ``pepper notes`` subcommands (the read side:
+``list``/``search``/``show``, plus the write side).
 
 Same approach as ``test_cli_groups.py``: invoke ``cli.main([...])`` with a
 monkeypatched ``api_client.ApiClient`` so commands run without the network.
@@ -162,7 +162,7 @@ class _FakeNotesApi:
         self.calls.append(("edit_artifact", artifact_id, name, body, principal, if_match))
         # ``edit`` may be a single canned result/exception (the common
         # case) or a list, consumed one per call in order — needed for the
-        # §6 conflict-then-retry tests, where the first call must 412 and a
+        # conflict-then-retry tests, where the first call must 412 and a
         # later one must succeed.
         value = self._canned.get("edit")
         if isinstance(value, list):

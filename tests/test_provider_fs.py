@@ -1,10 +1,10 @@
 """The escape matrix, and the caps, for the local filesystem toolset.
 
-``planning/client-tools.md`` §3 puts **all** filesystem enforcement on this
+The client-tools design puts **all** filesystem enforcement on this
 side of the wire — the server sends a tool name and arguments and cannot
 check a path on a disk it cannot see. So this file is where the security
 argument of the whole feature is either true or not, and each test here is
-one row of the doc's own matrix: ``..``, a symlink pointing out of the root,
+one row of the escape matrix: ``..``, a symlink pointing out of the root,
 an absolute path, and a root-prefix confusion like ``/notes`` versus
 ``/notes-private``.
 """

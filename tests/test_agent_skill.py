@@ -56,7 +56,7 @@ _HEADING = re.compile(r"^## ")
 _CANNOT_RUN = "cannot run"
 # The ``groups`` subcommands whose server route admits an agent token, and the
 # flags on them that reach a route which does not. Mirrors
-# ``AGENT_ALLOWED_ROUTES`` in the server's ``src/pepper/api/groups.py``: ``watch``
+# the server's allowlist of routes an agent token may reach: ``watch``
 # is the events stream, ``react``/``unreact`` the two reactions routes, ``--mark``
 # the read-mark route and ``--attach`` the upload route (both personal-token only).
 _AGENT_COMMANDS = frozenset(
