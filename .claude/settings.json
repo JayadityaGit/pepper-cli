@@ -1,0 +1,22 @@
+{
+  "extraKnownMarketplaces": {
+    "maintainerd": {
+      "source": {
+        "source": "github",
+        "repo": "Vycari/maintainerd"
+      }
+    },
+    "vycari": {
+      "source": {
+        "source": "github",
+        "repo": "Vycari/vycari"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "maintainerd-core@maintainerd": true,
+    "repo-ops@maintainerd": true,
+    "audits@maintainerd": true,
+    "vycari-ops@vycari": true
+  }
+}
