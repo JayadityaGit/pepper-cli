@@ -51,6 +51,40 @@ NOT_CHECKABLE: dict[tuple[str, str], str] = {
         "(pending/denied/approved/...) with no schema in the snapshot, and DevicePoll also "
         "folds in a client-synthesised 'slow_down' state from an HTTP 429."
     ),
+    ("api_client.py", "src/pepper/api/groups.py::room_topics"): (
+        "Names a route handler whose response is an untyped dict: the snapshot declares no "
+        "schema for it, so there is nothing to resolve. Covers GroupTopicSummary."
+    ),
+    ("api_client.py", "src/pepper/api/groups.py::list_groups"): (
+        "Names a route handler whose response is an untyped dict: the snapshot declares no "
+        "schema for it, so there is nothing to resolve. Covers GroupSummary and GroupList."
+    ),
+    ("api_client.py", "src/pepper/api/groups.py::topic_messages"): (
+        "Names a route handler whose response is an untyped dict: the snapshot declares no "
+        "schema for it, so there is nothing to resolve. Covers GroupCard, GroupMessage and "
+        "GroupMessagePage."
+    ),
+    ("api_client.py", "src/pepper/api/groups.py::room_roster"): (
+        "Names a route handler whose response is an untyped dict: the snapshot declares no "
+        "schema for it, so there is nothing to resolve. Covers GroupRosterMember."
+    ),
+    ("api_client.py", "src/pepper/api/groups.py::app_launcher"): (
+        "Names a route handler whose response is an untyped dict: the snapshot declares no "
+        "schema for it, so there is nothing to resolve. Covers GroupAppTile."
+    ),
+    ("api_client.py", "src/pepper/api/groups.py::agent_events_stream"): (
+        "Names the agent event-feed SSE route (FeedFrame). Stream frames are not described by "
+        "the snapshot, so there is no schema to resolve."
+    ),
+    ("api_client.py", "src/pepper/api/router.py::chat_send"): (
+        "Names the chat route whose SSE path emits StreamEvent frames. The snapshot describes "
+        "only the JSON reply (ChatSendResponse, mirrored on ChatReply), not the stream "
+        "frames."
+    ),
+    ("api_client.py", "src/pepper/agent/artifacts/applet.py::read_detail"): (
+        "Names the function behind the artifact detail route (ArtifactDetail), which answers "
+        "an untyped JSONResponse; the snapshot declares no schema for it."
+    ),
     ("cli.py", "src/pepper/agent/artifacts/service.py::INLINE_TEXT"): (
         "Mirrors a string constant (the artifact kind), not a model, and annotates no dataclass."
     ),
