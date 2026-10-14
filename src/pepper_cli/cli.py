@@ -34,10 +34,13 @@ Subcommands:
   skill's owner or a room owner revokes. A room never owns a skill, so
   ``new``/``edit``/``delete`` refuse ``--room``.
 - ``pepper groups list | show | topics | read | post`` — read and post in
-  your rooms/channels and their topics. ``pepper groups watch [--since CURSOR]
-  [--cursor-file PATH] [--json] [--kinds K,...] [--ignore-kinds K,...]`` is the
-  agent-member counterpart of polling ``read``: it consumes the agent's event
-  stream (SSE), one line per event, and reconnects from its cursor. Also edit /
+  your rooms/channels and their topics. ``pepper groups watch [--room ROOM
+  [--topic TOPIC]] [--since CURSOR] [--cursor-file PATH] [--json] [--kinds K,...]
+  [--ignore-kinds K,...]`` is the agent-member counterpart of polling ``read``:
+  it consumes the agent's event stream (SSE), one line per event, and
+  reconnects from its cursor; ``--room``/``--topic`` have the server narrow
+  it to one room or topic (exit 3 when the server can no longer replay from
+  the cursor asked for). Also edit /
   delete-message / react / unreact / download, new-topic / rename-topic / archive-topic /
   unarchive-topic, new / rename / archive / unarchive / leave / mute /
   unmute, invite / remove / role, apps / install-app / uninstall-app,
@@ -80,6 +83,7 @@ import time
 import uuid
 import webbrowser
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
@@ -961,8 +965,26 @@ def _build_parser() -> tuple[argparse.ArgumentParser, frozenset[str]]:
             "(a pep_agt_ token). Prints one line per event, reconnecting from the last "
             "cursor with backoff when the stream drops, and exits non-zero if the "
             "token is revoked. Events carry ids, not message bodies: read a body "
-            "with 'groups read'."
+            "with 'groups read'. --room (and --topic) narrow the stream on the server "
+            "to one room, or one topic in it; a server that cannot do that is an "
+            "error, never a wider stream. Under --room, a mention of you in another "
+            "room is not shown; under --topic, room-wide events (membership, room "
+            "renames) are not shown either."
         ),
+    )
+    p_groups_watch.add_argument(
+        "--room",
+        default=None,
+        metavar="ROOM",
+        help="Only this room's events (an id, or a name or unique name prefix). "
+        "Exit 2 if it does not resolve or you are not a member.",
+    )
+    p_groups_watch.add_argument(
+        "--topic",
+        default=None,
+        metavar="TOPIC",
+        help="Only this topic's events, within --room (required). Without it, every "
+        "topic in the room.",
     )
     p_groups_watch.add_argument(
         "--since",
@@ -977,7 +999,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, frozenset[str]]:
         default=None,
         metavar="PATH",
         help="Persist the cursor here (atomically, after each event is printed) and "
-        "start from it when --since is not given.",
+        "start from it when --since is not given. Use one file per scope: a scoped "
+        "watch's file records its room and topic, and a file from another scope is "
+        "refused (exit 2).",
     )
     p_groups_watch.add_argument(
         "--json",
@@ -3136,7 +3160,9 @@ def _group_list_or_error(
     return gl
 
 
-def _resolve_group(api: api_client.ApiClient, value: str) -> str | None:
+def _resolve_group(
+    api: api_client.ApiClient, value: str, *, rooms: api_client.GroupList | None = None
+) -> str | None:
     """Resolve ``<group>`` to its id.
 
     A UUID passes straight through untouched — same contract as
@@ -3145,11 +3171,12 @@ def _resolve_group(api: api_client.ApiClient, value: str) -> str | None:
     by name against the caller's unarchived rooms first, falling back to
     the archived ones so an archived room's name still resolves without
     ``--archived`` on the enclosing command (only ``groups list``/``topics``
-    have a reason to distinguish the two folds).
+    have a reason to distinguish the two folds). ``rooms`` is the
+    unarchived list when the caller has already fetched it.
     """
     if _valid_uuid(value):
         return value
-    gl = _group_list_or_error(api)
+    gl = rooms if rooms is not None else _group_list_or_error(api)
     match, candidates = _match_by_name(value, gl.groups, name_of=lambda g: g.display_name)
     if match is None and not candidates:
         archived = api.list_groups(archived=True)
@@ -3483,17 +3510,88 @@ def _kind_list(value: str) -> frozenset[str]:
 
 
 def _watch_frame_shows_health(frame: api_client.FeedFrame) -> bool:
-    """Whether ``frame`` proves the stream is past connecting and working."""
-    if frame.kind == "error":
+    """Whether ``frame`` proves the stream is past connecting and working.
+
+    Not a ``scope`` frame: like ``: connected`` it is sent on every accepted
+    connection, including each one an outage answers with a retryable error.
+    """
+    if frame.kind in ("error", "scope"):
         return False
     return not (frame.kind == "comment" and frame.payload.get("comment") == "connected")
 
 
-def _read_cursor_file(path: str) -> int | None:
-    """The cursor stored in ``path``, ``None`` when the file does not exist.
+#: Version of the one-line JSON a scoped watch keeps in its cursor file.
+_SCOPED_CURSOR_VERSION = 1
 
-    Raises ``ValueError`` for a file that exists but is not a non-negative
-    integer: silently restarting from 0 would replay the whole feed.
+
+@dataclass(frozen=True)
+class _ScopedCursor:
+    """A scoped watch's cursor file: the position, and the watch it belongs to.
+
+    The feed's cursor is a position in the agent's whole feed, so a bare
+    number says nothing about which room's events have been seen. Binding it
+    to the server, agent, room and topic is what stops one scope's file from
+    silently skipping another scope's events. ``room_id`` is the room the
+    server confirmed it is serving (the survivor, when the requested room was
+    merged into another).
+    """
+
+    server: str
+    agent_person_id: str
+    room_id: str
+    topic_id: str | None
+    cursor: int
+
+    def to_line(self) -> str:
+        import json
+
+        return json.dumps(
+            {
+                "v": _SCOPED_CURSOR_VERSION,
+                "server": self.server,
+                "agent_person_id": self.agent_person_id,
+                "room_id": self.room_id,
+                "topic_id": self.topic_id,
+                "cursor": self.cursor,
+            },
+            separators=(",", ":"),
+        )
+
+
+def _scoped_cursor_from_text(text: str) -> _ScopedCursor | None:
+    """Parse a scoped cursor file's JSON line; ``None`` if it is not one."""
+    import json
+
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or data.get("v") != _SCOPED_CURSOR_VERSION:
+        return None
+    strings = [data.get(k) for k in ("server", "agent_person_id", "room_id")]
+    topic, cursor = data.get("topic_id"), data.get("cursor")
+    if not all(isinstance(v, str) and v for v in strings):
+        return None
+    if topic is not None and not (isinstance(topic, str) and topic):
+        return None
+    if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
+        return None
+    return _ScopedCursor(
+        server=data["server"],
+        agent_person_id=data["agent_person_id"],
+        room_id=data["room_id"],
+        topic_id=topic,
+        cursor=cursor,
+    )
+
+
+def _read_cursor_state(path: str) -> int | _ScopedCursor | None:
+    """What ``path`` holds: a bare cursor (an unscoped watch's), a
+    :class:`_ScopedCursor` (a scoped watch's), or ``None`` when the file does
+    not exist.
+
+    Raises ``ValueError`` for a file that exists but is neither: silently
+    restarting from 0 would replay the whole feed.
     """
     from pathlib import Path
 
@@ -3501,18 +3599,22 @@ def _read_cursor_file(path: str) -> int | None:
         text = Path(path).read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         return None
-    if not text.isdecimal():
-        msg = f"cursor file {path!r} does not hold an integer cursor"
+    if text.isdecimal():
+        return int(text)
+    scoped = _scoped_cursor_from_text(text)
+    if scoped is None:
+        msg = f"cursor file {path!r} does not hold an integer cursor or a scoped watch's position"
         raise ValueError(msg)
-    return int(text)
+    return scoped
 
 
-def _write_cursor_file(path: str, cursor: int) -> None:
+def _write_cursor_file(path: str, cursor: int | _ScopedCursor) -> None:
     """Replace ``path`` with ``cursor`` atomically (write a sibling, fsync,
     rename), so a crash mid-write leaves the old cursor and never a torn one."""
     import tempfile
     from pathlib import Path
 
+    line = cursor.to_line() if isinstance(cursor, _ScopedCursor) else str(cursor)
     target = Path(path)
     # mkstemp creates the sibling exclusively with an unpredictable name, so a
     # planted symlink at the temp path cannot redirect the write.
@@ -3520,7 +3622,7 @@ def _write_cursor_file(path: str, cursor: int) -> None:
     tmp = Path(tmp_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(f"{cursor}\n")
+            fh.write(f"{line}\n")
             fh.flush()
             os.fsync(fh.fileno())
         tmp.replace(target)
@@ -3568,13 +3670,18 @@ def cmd_groups_watch(args: argparse.Namespace) -> int:
 
     Exit codes: 0 on Ctrl-C, 1 on a refused token (401), a token that is not
     an agent's (403), a server that has no stream (404), or an ``error`` frame
-    the server marks non-retryable (a suspended agent), 2 on bad arguments.
-    Dropped connections, 5xx and ``retry: true`` error frames reconnect with
+    the server marks non-retryable (a suspended agent), 2 on bad arguments
+    (including a cursor file a scoped watch wrote). Dropped connections, 5xx
+    and ``retry: true`` error frames reconnect with
     exponential backoff from the last cursor seen. The first failures of a run
     are silent (a reconnect loses nothing); the ``Feed unavailable`` notice
     on stderr starts at the third consecutive failure and ends when the
     stream next shows a sign of life.
+
+    ``--room`` (and ``--topic``) hand the run to :func:`_cmd_groups_watch_scoped`.
     """
+    if args.room is not None or args.topic is not None:
+        return _cmd_groups_watch_scoped(args)
     creds = _load_or_error()
     if creds is None:
         return 1
@@ -3582,12 +3689,27 @@ def cmd_groups_watch(args: argparse.Namespace) -> int:
     if cursor is not None and cursor < 0:
         render.error("--since must be a non-negative cursor.")
         return 2
-    if cursor is None and args.cursor_file:
+    if args.cursor_file:
         try:
-            cursor = _read_cursor_file(args.cursor_file)
+            stored = _read_cursor_state(args.cursor_file)
         except (ValueError, OSError) as exc:
-            render.error(str(exc))
+            # With --since the file is only being checked, as before.
+            stored = None
+            if cursor is None:
+                render.error(str(exc))
+                return 2
+        if isinstance(stored, _ScopedCursor):
+            # Even with --since: the run would overwrite another watch's position.
+            render.error(
+                f"The cursor file {args.cursor_file} belongs to a scoped watch (room "
+                f"{stored.room_id}, topic {stored.topic_id or 'any'}), not the "
+                "unscoped one requested. Nothing was streamed. Use a separate "
+                "--cursor-file for each scope.",
+                soft_wrap=True,
+            )
             return 2
+        if cursor is None:
+            cursor = stored
     cursor = cursor or 0
     allowed: frozenset[str] | None = args.kinds
     ignored: frozenset[str] = args.ignore_kinds or frozenset()
@@ -3662,17 +3784,418 @@ def cmd_groups_watch(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         return 0
     except BrokenPipeError:
-        # The reader went away (``| head -1``): nothing to report, and the
-        # cursor was not advanced past the line that failed to print.
-        # Point stdout at /dev/null so the interpreter's own flush at exit does
-        # not raise a second BrokenPipeError (Python's documented SIGPIPE recipe).
-        with contextlib.suppress(OSError, ValueError):
-            devnull = os.open(os.devnull, os.O_WRONLY)
-            os.dup2(devnull, sys.stdout.fileno())
-        return 0
+        return _watch_reader_gone()
     except OSError as exc:
         render.error(f"Couldn't write the cursor file: {exc}")
         return 1
+
+
+def _watch_reader_gone() -> int:
+    """The reader went away (``| head -1``): nothing to report, and the
+    cursor was not advanced past the line that failed to print.
+
+    Point stdout at /dev/null so the interpreter's own flush at exit does not
+    raise a second BrokenPipeError (Python's documented SIGPIPE recipe).
+    """
+    with contextlib.suppress(OSError, ValueError):
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+    return 0
+
+
+#: The capability ``GET /api/v1/groups`` lists when the server has the room-
+#: and topic-scoped streams. Without it a scoped watch refuses to start: the
+#: only other stream is the roster-wide one, and following that would print
+#: events from rooms the caller asked not to see.
+_WATCH_SCOPE_FEATURE = "watch_scope"
+
+#: The error slug a scoped stream ends with when it cannot replay from the
+#: position asked for without a gap. Its frame carries ``since`` and ``floor``.
+_WATCH_HISTORY_EXPIRED = "history_expired"
+
+#: What the scoped stream's other terminal slugs mean, for the stderr line.
+_WATCH_SCOPED_ENDINGS = {
+    "access_revoked": "you are no longer a member of this room",
+    "room_deleted": "the room was deleted",
+    "room_superseded": (
+        "the room was merged into another room; run 'pepper groups list' to find "
+        "it and watch that room instead"
+    ),
+}
+
+
+class _WatchStopError(Exception):
+    """End a scoped watch with ``code``; the reason is already on stderr."""
+
+    def __init__(self, code: int) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def _canonical_id(value: str) -> str:
+    """``value`` in the UUID spelling the server echoes (lowercase, hyphenated)."""
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        return value
+
+
+def _same_id(value: object, expected: str | None) -> bool:
+    """Whether ``value`` names ``expected``: equal as UUIDs (so letter case does
+    not matter), else equal as strings. ``None`` matches only ``None``."""
+    if value is None or expected is None:
+        return value is None and expected is None
+    if not isinstance(value, str):
+        return False
+    return _canonical_id(value) == _canonical_id(expected)
+
+
+def _scope_words(room_id: str, topic_id: str | None, agent: str | None = None) -> str:
+    words = f"room {room_id}, topic {topic_id or 'any'}"
+    return f"agent {agent}, {words}" if agent else words
+
+
+def _scoped_watch_target(
+    api: api_client.ApiClient, room: str, topic: str | None
+) -> tuple[str, str | None]:
+    """Check the server can scope a watch, then resolve ``--room``/``--topic``.
+
+    The capability check comes first and fails closed: a server that does not
+    list ``watch_scope`` is never sent a scoped request, and nothing falls back
+    to the roster-wide stream. A topic is resolved only when one was named,
+    since "no topic" means the whole room, not the room's default topic.
+    """
+    listing = _group_list_or_error(api)
+    if _WATCH_SCOPE_FEATURE not in listing.features:
+        render.error(
+            "This server does not support a scoped watch (--room/--topic). Nothing was streamed."
+        )
+        raise _WatchStopError(1)
+    room_id = _resolve_group(api, room, rooms=listing)
+    if room_id is None:
+        raise _BadInputError
+    room_id = _canonical_id(room_id)
+    topic_id = None
+    if topic is not None:
+        topic_id = _resolve_topic(api, room_id, topic)
+        if topic_id is None:
+            raise _BadInputError
+        topic_id = _canonical_id(topic_id)
+    return room_id, topic_id
+
+
+def _confirm_scope(
+    frame: api_client.FeedFrame, room_id: str, topic_id: str | None
+) -> api_client.WatchScope:
+    """The scope a connection's first frame names, if it is the one asked for.
+
+    Anything else (another kind of frame first, an unreadable scope frame, a
+    scope for another room or topic) ends the run: the events that follow
+    cannot be trusted to be the ones asked for.
+    """
+    scope = api_client.watch_scope_from_frame(frame)
+    if (
+        scope is None
+        or not _same_id(scope.requested_room_id, room_id)
+        or not _same_id(scope.topic_id, topic_id)
+    ):
+        render.error(
+            "The server did not confirm the requested scope "
+            f"({_scope_words(room_id, topic_id)}); stopping. Nothing from this "
+            "connection was printed.",
+            soft_wrap=True,
+        )
+        raise _WatchStopError(1)
+    return scope
+
+
+def _same_watch(scope: api_client.WatchScope, other: api_client.WatchScope) -> bool:
+    return (
+        _same_id(scope.room_id, other.room_id)
+        and _same_id(scope.topic_id, other.topic_id)
+        and _same_id(scope.agent_person_id, other.agent_person_id)
+    )
+
+
+def _check_cursor_binding(
+    path: str | None, stored: _ScopedCursor | None, scope: api_client.WatchScope
+) -> None:
+    """Refuse a cursor file another scope wrote. Its position is in the agent's
+    whole feed, so using it here would skip this scope's events silently."""
+    if path is None or stored is None:
+        return
+    if (
+        _same_id(stored.room_id, scope.room_id)
+        and _same_id(stored.topic_id, scope.topic_id)
+        and _same_id(stored.agent_person_id, scope.agent_person_id)
+    ):
+        return
+    theirs = _scope_words(stored.room_id, stored.topic_id, stored.agent_person_id)
+    ours = _scope_words(scope.room_id, scope.topic_id, scope.agent_person_id)
+    render.error(
+        f"The cursor file {path} belongs to a different watch ({theirs}) than the one "
+        f"requested ({ours}). Nothing was streamed. Use a separate --cursor-file for each "
+        f"scope; to carry the position over, pass --since {stored.cursor} with a new file.",
+        soft_wrap=True,
+    )
+    raise _WatchStopError(2)
+
+
+def _event_in_scope(event: dict[str, Any], scope: api_client.WatchScope) -> bool:
+    """Whether a scoped stream's event really is in ``scope``: the server's own
+    admission rule, checked again on this side so a server bug cannot widen a
+    watch the caller narrowed."""
+    if not _same_id(event.get("room_id"), scope.room_id):
+        return False
+    if not _same_id(event.get("group_id"), scope.service_group_id):
+        return False
+    payload = event.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    if "group_id" in payload and not _same_id(payload["group_id"], scope.service_group_id):
+        return False
+    return scope.topic_id is None or _same_id(payload.get("topic_id"), scope.topic_id)
+
+
+def _scoped_watch_problem(frame: api_client.FeedFrame, room_id: str, topic_id: str | None) -> str:
+    """The retryable problem an ``error`` frame reports, or end the run.
+
+    ``history_expired`` exits 3 and says where the gap is; the cursor file is
+    left where it was, so nothing claims the gap was read. ``room_id`` is the
+    room to read the gap from: the survivor, once the server has said the
+    room asked for was merged into it.
+    """
+    payload = frame.payload
+    slug = str(payload.get("error", "error"))
+    if slug == _WATCH_HISTORY_EXPIRED:
+        floor, since = payload.get("floor"), payload.get("since")
+        read = f"pepper groups read {room_id} {topic_id or 'TOPIC'}"
+        render.error(
+            f"Replay history before position {floor} is no longer available; events "
+            f"between {since} and {floor} in this scope were not delivered. Read the gap "
+            f"with '{read}'{'' if topic_id else ' for each topic'}, then restart with "
+            f"--since {floor}.",
+            soft_wrap=True,
+        )
+        raise _WatchStopError(3)
+    if payload.get("retry") is False:
+        ending = _WATCH_SCOPED_ENDINGS.get(slug)
+        if ending is not None:
+            render.error(f"The server ended the stream: {ending}.")
+        else:
+            render.error(f"The server closed the stream and will not resume it: {slug}.")
+        raise _WatchStopError(1)
+    return slug
+
+
+def _cmd_groups_watch_scoped(args: argparse.Namespace) -> int:
+    """``pepper groups watch --room ROOM [--topic TOPIC] ...``: the stream
+    narrowed by the server to one room, or one topic in it.
+
+    Fails closed throughout. A server without the capability, a connection
+    whose first frame does not confirm the scope asked for, and an event
+    outside the scope all stop the run (exit 1) without printing, and none
+    of them fall back to the roster-wide stream. A reconnect re-checks the
+    scope; one that names another room, topic or agent than the run started
+    with stops it too. When the room asked for was merged into another, the
+    server serves the survivor and says so; that is reported once on stderr.
+
+    The cursor file holds one JSON line binding the position to the server,
+    agent, room and topic. A file another watch wrote (another scope, or the
+    unscoped watch's bare number) is refused with exit 2, even with --since.
+
+    Exit codes beyond the unscoped watch's: 2 for a room or topic that does
+    not resolve, a 404 (no such room or topic, or not a member), or
+    ``--topic`` without ``--room``; 3 when the server can no longer replay
+    from the position asked for (``history_expired``).
+    """
+    if args.room is None:
+        render.error("--topic needs --room: a topic is named within one room.")
+        return 2
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    if args.since is not None and args.since < 0:
+        render.error("--since must be a non-negative cursor.")
+        return 2
+    stored: _ScopedCursor | None = None
+    if args.cursor_file:
+        try:
+            state = _read_cursor_state(args.cursor_file)
+        except (ValueError, OSError) as exc:
+            render.error(str(exc))
+            return 2
+        if isinstance(state, int):
+            render.error(
+                f"The cursor file {args.cursor_file} holds the unscoped watch's cursor, not a "
+                "scoped one. Nothing was streamed. Use a separate --cursor-file for each "
+                f"scope; to carry the position over, pass --since {state} with a new file.",
+                soft_wrap=True,
+            )
+            return 2
+        if state is not None and state.server != creds.server_url:
+            render.error(
+                f"The cursor file {args.cursor_file} belongs to a watch on another server "
+                f"({state.server}). Nothing was streamed. Use a separate --cursor-file for "
+                "each server.",
+                soft_wrap=True,
+            )
+            return 2
+        stored = state
+    # --since moves the start, never the binding checked against the scope.
+    cursor = stored.cursor if stored is not None else 0
+    if args.since is not None:
+        cursor = args.since
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            room_id, topic_id = _scoped_watch_target(api, args.room, args.topic)
+            return _follow_scoped_watch(
+                api,
+                args,
+                server=creds.server_url,
+                room_id=room_id,
+                topic_id=topic_id,
+                stored=stored,
+                cursor=cursor,
+            )
+    except _WatchStopError as stop:
+        return stop.code
+    except _BadInputError:
+        return 2
+    except _GroupsDisabledError:
+        render.error("Groups is not enabled for your account.")
+        return 1
+    except api_client.ApiError as exc:
+        return _report_room_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    except KeyboardInterrupt:
+        return 0
+    except BrokenPipeError:
+        return _watch_reader_gone()
+    except OSError as exc:
+        render.error(f"Couldn't write the cursor file: {exc}")
+        return 1
+
+
+def _follow_scoped_watch(
+    api: api_client.ApiClient,
+    args: argparse.Namespace,
+    *,
+    server: str,
+    room_id: str,
+    topic_id: str | None,
+    stored: _ScopedCursor | None,
+    cursor: int,
+) -> int:
+    """The scoped watch's connect / read / reconnect loop. Same output, cursor
+    and backoff rules as the unscoped loop in :func:`cmd_groups_watch`; it
+    returns only by raising (Ctrl-C, or :class:`_WatchStopError`) or with the
+    exit code of a status reconnecting cannot fix."""
+    allowed: frozenset[str] | None = args.kinds
+    ignored: frozenset[str] = args.ignore_kinds or frozenset()
+    bound: api_client.WatchScope | None = None
+    reconnecting = False
+    delay = _WATCH_BACKOFF_START
+    failures = 0
+    while True:
+        problem: str | None = None
+        try:
+            frames = api.watch_scoped_events(
+                room_id,
+                topic_id=topic_id,
+                since=cursor,
+                last_event_id=cursor if reconnecting else None,
+            )
+            with contextlib.closing(frames):
+                scope: api_client.WatchScope | None = None
+                for frame in frames:
+                    if _watch_frame_shows_health(frame):
+                        delay = _WATCH_BACKOFF_START
+                        failures = 0
+                    if frame.kind == "error":
+                        served = scope.room_id if scope is not None else room_id
+                        problem = _scoped_watch_problem(frame, served, topic_id)
+                        break
+                    if frame.kind == "comment":
+                        continue
+                    if scope is None or frame.kind == "scope":
+                        seen = _confirm_scope(frame, room_id, topic_id)
+                        if bound is None:
+                            _check_cursor_binding(args.cursor_file, stored, seen)
+                            bound = seen
+                            if not _same_id(seen.room_id, seen.requested_room_id):
+                                render.info(
+                                    f"Room {seen.requested_room_id} was merged into room "
+                                    f"{seen.room_id}; following {seen.room_id}."
+                                )
+                        elif not _same_watch(seen, bound):
+                            render.error(
+                                "The server is now serving another scope "
+                                f"({_scope_words(seen.room_id, seen.topic_id)}) than this "
+                                f"run started with ({_scope_words(bound.room_id, bound.topic_id)})"
+                                "; stopping. Re-run against the room you mean to follow.",
+                                soft_wrap=True,
+                            )
+                            raise _WatchStopError(1)
+                        scope = seen
+                        continue
+                    if frame.id is not None:
+                        new_cursor = frame.id
+                    elif frame.kind == "cursor" and isinstance(frame.payload.get("cursor"), int):
+                        new_cursor = frame.payload["cursor"]
+                    else:
+                        continue
+                    if frame.kind == "cursor":
+                        if args.json:
+                            _emit_line(_watch_cursor_line(new_cursor))
+                    else:
+                        if not _event_in_scope(frame.payload, scope):
+                            render.error(
+                                f"The server sent event {new_cursor} ({frame.kind}) from "
+                                "outside the requested scope "
+                                f"({_scope_words(scope.room_id, scope.topic_id)}); stopping. "
+                                "It was not printed and the cursor did not move past it.",
+                                soft_wrap=True,
+                            )
+                            raise _WatchStopError(1)
+                        if (allowed is None or frame.kind in allowed) and (
+                            frame.kind not in ignored
+                        ):
+                            _emit_line(
+                                _watch_event_line(
+                                    frame.payload, as_json=args.json, cursor=new_cursor
+                                )
+                            )
+                    cursor = max(cursor, new_cursor)
+                    if args.cursor_file:
+                        _write_cursor_file(
+                            args.cursor_file,
+                            _ScopedCursor(
+                                server=server,
+                                agent_person_id=scope.agent_person_id,
+                                room_id=scope.room_id,
+                                topic_id=scope.topic_id,
+                                cursor=cursor,
+                            ),
+                        )
+        except api_client.ApiError as exc:
+            if exc.status in _WATCH_FATAL_STATUSES:
+                return _report_room_error(exc)
+            problem = f"HTTP {exc.status}"
+        except httpx.RequestError as exc:
+            problem = type(exc).__name__
+        pause = delay
+        if problem is not None:
+            failures += 1
+            immediate = problem == _WATCH_SERVER_RESTARTING and failures == 1
+            pause = 0.0 if immediate else delay
+            if failures >= _WATCH_QUIET_FAILURES:
+                render.error(f"Feed unavailable ({problem}); retrying in {pause:g}s.")
+        reconnecting = True
+        if pause:
+            time.sleep(pause)
+            delay = min(delay * 2, _WATCH_BACKOFF_CAP)
 
 
 def _watch_cursor_line(cursor: int) -> str:

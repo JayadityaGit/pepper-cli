@@ -203,7 +203,7 @@ pepper whoami
 | `pepper groups sharing <group> [--set CALENDAR=LEVEL …] [--json]` | Which of your calendars the room sees, and at what level; `--set` changes the ones you name. |
 | `pepper groups activity [<group>] [--since TS] [--json]` | The newest message from someone else in each recently active topic (default: last 24 hours). |
 | `pepper groups search <query> [--json]` | Find topics by name across your unarchived rooms. |
-| `pepper groups watch [--since CURSOR] [--cursor-file PATH] [--json]` | Agent members: follow the event stream, one line per event (ids only; fetch bodies with `groups read`). Reconnects by itself and resumes from the cursor file. |
+| `pepper groups watch [--room ROOM [--topic TOPIC]] [--since CURSOR] [--cursor-file PATH] [--json]` | Agent members: follow the event stream, one line per event (ids only; fetch bodies with `groups read`). Reconnects by itself and resumes from the cursor file. `--room`/`--topic` have the server narrow the stream to one room or topic, and refuse (never widen) on a server that cannot; use one cursor file per scope. Exit 3 when the server can no longer replay from the cursor without a gap. |
 | `pepper agent-skill [--write DIR [--force]]` | Print the agent-usage guide (`SKILL.md`) shipped inside this binary: how an agent member logs in, watches, reads and posts in rooms. `--write DIR` writes `DIR/SKILL.md` and refuses to overwrite without `--force`. Needs no login and no network. |
 | `pepper notes list [--room <group>] [--label L] [--json]` | List your notes, or a room's shared ones with `--room`. |
 | `pepper notes search "<query>" [--room <group>] [--label L] [--json]` | Case-insensitive substring search over note names and bodies. |

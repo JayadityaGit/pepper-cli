@@ -449,9 +449,9 @@ def test_malformed_frames_are_dropped_not_fatal():
 
 def test_the_cursor_file_helpers_round_trip(tmp_path: Path):
     path = str(tmp_path / "c")
-    assert cli._read_cursor_file(path) is None
+    assert cli._read_cursor_state(path) is None
     cli._write_cursor_file(path, 42)
-    assert cli._read_cursor_file(path) == 42
+    assert cli._read_cursor_state(path) == 42
 
 
 def test_the_cursor_write_does_not_follow_a_planted_symlink(tmp_path):
