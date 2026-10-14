@@ -1,0 +1,32 @@
+{
+  // Markdown lint for the `docs` job in ci.yml. Lenient baseline, copied from
+  // Vycari/scribe: every rule disabled below is stylistic (line length, blank
+  // lines around headings and lists, emphasis style, bare URLs) and is one
+  // this repo's prose is expected to violate. What stays on is what signals
+  // actual breakage: reversed link syntax (MD011), empty links (MD042),
+  // malformed tables (MD055/MD056/MD058), hard tabs (MD010), heading
+  // increments (MD001).
+  // Tighten by deleting a line and cleaning up what it flags.
+  "config": {
+    "MD004": false, // ul-style
+    "MD009": false, // trailing spaces
+    "MD012": false, // multiple consecutive blank lines
+    "MD013": false, // line-length — prose
+    "MD018": false, // no-space-after-hash — false-fires on issue refs ("#12 …")
+    "MD022": false, // blanks-around-headings
+    "MD024": false, // duplicate headings
+    "MD025": false, // single-h1
+    "MD029": false, // ol-prefix
+    "MD031": false, // blanks-around-fences
+    "MD032": false, // blanks-around-lists
+    "MD033": false, // inline HTML — used deliberately
+    "MD034": false, // bare URLs
+    "MD036": false, // emphasis-as-heading
+    "MD038": false, // space-in-code-span
+    "MD040": false, // fenced-code-language
+    "MD041": false, // first-line-heading
+    "MD049": false  // emphasis-style
+  },
+  "globs": ["**/*.md"],
+  "ignores": [".venv/**", "node_modules/**"]
+}

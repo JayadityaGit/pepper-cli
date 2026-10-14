@@ -1,0 +1,4898 @@
+"""Command-line entry point for ``pepper``.
+
+Subcommands:
+
+- ``pepper login [--server URL] [--token TOKEN] [--manual] [--no-browser]``
+  — store credentials. By default this drives the browser-based
+  device-authorization flow: start a device login, print a human code
+  + verification URL, open the browser (unless ``--no-browser``), poll
+  until approved, then validate the minted token via ``GET
+  /api/v1/whoami`` before writing it. ``--token`` (scripting) or
+  ``--manual`` (force the prompt) fall back to pasting a PAT minted in
+  the web UI — the same manual path this command used to be the only
+  way to do. A pasted agent token (``pep_agt_``) is validated against
+  ``GET /api/v1/groups`` instead, since it is not a Pepper account.
+- ``pepper whoami`` — print the user behind the current credentials.
+- ``pepper chat MESSAGE`` — one-shot turn against the server, render
+  the reply. ``pepper chat`` with no message (or bare ``pepper``) opens
+  the interactive REPL, which streams each turn over SSE.
+- ``pepper trajectory show <id> | list`` — inspect saved turns.
+- ``pepper calendar [today|week|schedule] [--planning]`` — read-only agenda.
+- ``pepper next [--room R] [--first K] [--all] [--json]`` — Now / Do next / Due soon / Later.
+- ``pepper todos list | add | done | dismiss | reopen`` — manage tracked
+  action items; ``--room`` acts on a room's todos instead of yours.
+- ``pepper scheduled-tasks list | show | runs | thread | add | edit |
+  pause | resume | destinations`` — manage recurring and one-off
+  scheduled prompts; ``--room`` (on ``list``/``add``/``pause``/``resume``/
+  ``destinations``) acts on a room's tasks instead of yours — any member
+  lists, only a room owner changes.
+- ``pepper skills list | show | new | edit | delete`` — author skills as
+  SKILL.md documents in ``$EDITOR``. ``delete`` asks before deleting
+  unless ``--yes``. ``pepper skills share | revoke NAME --room ROOM`` puts one
+  of your skills in a room or takes it out, and ``list``/``show`` take
+  ``--room`` to read what a room holds — any member reads and shares, the
+  skill's owner or a room owner revokes. A room never owns a skill, so
+  ``new``/``edit``/``delete`` refuse ``--room``.
+- ``pepper groups list | show | topics | read | post`` — read and post in
+  your rooms/channels and their topics. ``pepper groups watch [--since CURSOR]
+  [--cursor-file PATH] [--json] [--kinds K,...] [--ignore-kinds K,...]`` is the
+  agent-member counterpart of polling ``read``: it consumes the agent's event
+  stream (SSE), one line per event, and reconnects from its cursor. Also edit /
+  delete-message / react / unreact / download, new-topic / rename-topic / archive-topic /
+  unarchive-topic, new / rename / archive / unarchive / leave / mute /
+  unmute, invite / remove / role, apps / install-app / uninstall-app,
+  sharing, activity and search; the destructive ones confirm unless ``--yes``. Reference client for
+  the groups API — this is the surface a native port
+  reproduces, so a shape change here mirrors the server contract, not the
+  other way round.
+- ``pepper notes list | search | show | new | edit | rm`` — your text
+  artifacts: your own, or a room's shared ones with ``--room``. Reference
+  client for the artifacts API — ``show`` writes a note's raw
+  markdown body to stdout, byte-exact when piped, so ``show > f.md``
+  round-trips through ``notes edit --file f.md``. ``new``/``edit`` take the
+  body from ``$EDITOR``, ``--file PATH``, or ``--file -`` for stdin;
+  ``edit`` sends nothing when the text is unchanged and runs the
+  conflict flow (save + diff + re-open/overwrite/quit) on a stale
+  ``If-Match``. ``rm`` asks before deleting unless ``--yes``.
+- ``pepper takeout [--out FILE]`` — download a zip archive of everything
+  Pepper holds about your account.
+- ``pepper logout`` — delete the credentials file.
+- ``pepper agent-skill [--write DIR [--force]]`` — print (or write) the
+  SKILL.md shipped in this package that teaches an agent member to use the
+  CLI in rooms. Reads no credentials and makes no network call.
+
+Each command returns an integer exit code so shells / scripts can
+detect failure without parsing stderr.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import difflib
+import getpass
+import mimetypes
+import os
+import re
+import socket
+import sys
+import time
+import uuid
+import webbrowser
+from collections.abc import Callable, Sequence
+from typing import Any
+from urllib.parse import urlparse
+
+import httpx
+
+from pepper_cli import (
+    __version__,
+    agent_skill,
+    api_client,
+    credentials,
+    next_view,
+    proctitle,
+    render,
+    skill_doc,
+    window_title,
+)
+from pepper_cli.provider import fs as provider_fs
+from pepper_cli.secret import SecretStr
+
+#: Default server URL used by ``pepper login`` when ``--server`` is
+#: not provided and the user accepts the prompt default. Production
+#: instance — local-dev users pass ``--server http://localhost:8000``
+#: explicitly. (No env-var override yet; add one if running against
+#: multiple servers becomes routine.)
+_DEFAULT_SERVER = "https://pepper.vycari.ai"
+
+
+def _repl_title(server_url: str) -> str:
+    """Terminal window title for the REPL.
+
+    Bare ``Pepper`` against the default production server; ``Pepper
+    (host)`` otherwise, so a REPL pointed at a local dev server or a
+    self-hosted instance never looks indistinguishable from one talking
+    to production in your window/tab list.
+
+    Only the hostname (plus a port, when one is given) goes into the title,
+    never ``netloc``: a ``--server`` URL may carry ``user:password@``
+    userinfo, and a window title is visible to anyone looking at the screen
+    and to other processes that can read it. A URL with no parseable host
+    falls back to bare ``Pepper`` rather than echoing the raw string.
+    """
+    if server_url == _DEFAULT_SERVER:
+        return "Pepper"
+    parsed = urlparse(server_url)
+    host = parsed.hostname
+    if not host:
+        return "Pepper"
+    if ":" in host:  # IPv6 literal: re-bracket so a port suffix stays readable.
+        host = f"[{host}]"
+    try:
+        port = parsed.port
+    except ValueError:  # a malformed port; the host alone still identifies it
+        port = None
+    if port is not None:
+        host = f"{host}:{port}"
+    return f"Pepper ({host})"
+
+
+#: Destinations a user may pin a scheduled task to. Mirrors
+#: ``pepper.agent.scheduled_tasks.destinations.OFFERED`` — the server
+#: rejects anything outside it, so listing them as argparse ``choices``
+#: turns a typo into a local usage error instead of a round-trip 422.
+#: ``client_api`` is storable server-side but isn't offered in any
+#: picker, so it isn't here either.
+_DESTINATION_CHOICES = ("main_chat", "resend_email", "twilio_sms", "whatsapp")
+
+#: A room's task speaks a different dialect — the room's topic and every
+#: member's inbox, never one person's phone. Mirrors
+#: ``pepper.agent.scheduled_tasks.destinations.GROUP_OFFERED``.
+_ROOM_DESTINATION_CHOICES = ("groups_service", "resend_email")
+
+#: What ``--to`` accepts at parse time: both dialects, since argparse cannot
+#: see ``--room``. :func:`_destination_dialect_error` narrows it afterwards.
+_ANY_DESTINATION_CHOICES = (
+    *_DESTINATION_CHOICES,
+    *(d for d in _ROOM_DESTINATION_CHOICES if d not in _DESTINATION_CHOICES),
+)
+
+#: The one sentence a non-owner gets for any refused room-task write.
+_ROOM_TASK_OWNER_ONLY = "only a room owner can change its scheduled tasks."
+
+#: The one sentence anyone else gets for a refused ``skills revoke --room``.
+_ROOM_SKILL_REVOKE_FORBIDDEN = "only the skill's owner or a room owner can revoke it."
+#: A sealed room (a group text, an email thread) takes no shared skill today.
+_ROOM_SKILL_SEALED = (
+    "sharing a skill into this kind of room isn't allowed yet — "
+    "a skill can only be shared into a named channel."
+)
+#: ``skills new|edit|delete --room``: there is no such thing to do.
+_ROOM_OWNS_NO_SKILL = (
+    "a room never owns a skill, so there is nothing to {verb} there — {verb} your own "
+    "skill (without --room) and it updates everywhere it is shared. "
+    "'pepper skills share NAME --room ROOM' and 'pepper skills revoke NAME --room ROOM' "
+    "put it in a room or take it out."
+)
+_ROOM_SKILL_ARG_HELP = (
+    "Skill name (from ``skills list --room ROOM``) or, when two shared skills "
+    "have the same name, the grant id that listing prints."
+)
+
+#: Every task-addressing subcommand takes the same argument. The API is
+#: keyed by id, but a name is what the user (and the agent) actually calls
+#: a task — see :func:`_resolve_task_id`.
+_TASK_ARG_HELP = "Task name (from ``scheduled-tasks list``) or its UUID."
+
+#: Every group-addressing subcommand takes the same argument shape: a name
+#: (case-insensitive, unique prefix OK — resolved client-side over
+#: ``list_groups``/``list_group_topics``, same idiom as ``_resolve_task_id``)
+#: or the group's/topic's own UUID.
+_GROUP_ARG_HELP = "Room/channel name (case-insensitive, unique prefix OK) or its UUID."
+_TOPIC_ARG_HELP = "Topic name (case-insensitive, unique prefix OK) or its UUID."
+_NOTE_ARG_HELP = "Note name (case-insensitive, unique prefix OK) or its UUID."
+
+# MIRROR: src/pepper/agent/artifacts/service.py::INLINE_TEXT — the kind
+# value ``pepper notes`` restricts every list/search/show call to. This
+# package doesn't depend on pepper-server (see api_client.py's module
+# docstring), so the string is hardcoded rather than imported; a rename on
+# the server side MUST be matched here.
+_NOTES_KIND = "inline_text"
+
+#: Cap passed to the server when resolving a ``<note>`` name to an id.
+#: The server's own cap (``list_artifacts_route``: ``limit`` caps at 200),
+#: applied to listings already narrowed server-side (exact ``name=``, then
+#: ``name_prefix=``); the route has no offset or cursor, so a still-truncated
+#: answer is refused rather than resolved inside a page.
+_NOTE_RESOLVE_LIMIT = 200
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """CLI entry point. Returns a process exit code.
+
+    ``argv`` defaults to ``sys.argv[1:]`` when not provided — tests
+    pass a list explicitly to exercise commands without poking
+    ``sys.argv``.
+
+    Implicit-chat dispatch: if the first arg isn't a known subcommand
+    or a top-level flag, the whole arg list is treated as a single
+    chat message — ``pepper what's on my calendar`` shorthand for
+    ``pepper chat "what's on my calendar"``. Bare ``pepper`` (no args)
+    opens the REPL. The explicit ``pepper chat ...`` form keeps
+    working unchanged.
+    """
+    # First thing, every subcommand: a console-script's argv[0] is the
+    # interpreter, not ``pepper``, so tab-naming tools would otherwise show
+    # ``python3``. See ``proctitle`` for why this is best-effort.
+    proctitle.set_process_title("pepper")
+    argv = list(sys.argv[1:]) if argv is None else list(argv)
+
+    # Build the parser first so the set of known subcommand names
+    # comes from the same place that registers them. If we hard-coded
+    # the names here, a future ``trajectory`` (or whatever) subparser
+    # would silently fall into the implicit-chat path until someone
+    # remembered to bump the constant.
+    parser, subcommand_names = _build_parser()
+
+    # A leading ``--profile NAME`` is consumed before the implicit-chat
+    # decision below, so ``pepper --profile x groups …`` reaches ``groups``
+    # and ``pepper --profile x hello`` is still implicit chat. Set on every
+    # call (``None`` when absent) so one process never inherits a profile.
+    try:
+        profile, argv = _consume_profile(argv)
+        credentials.set_profile(profile)
+    except ValueError as exc:
+        print(f"pepper: {exc}", file=sys.stderr)
+        return 2
+
+    if not argv:
+        # Bare ``pepper`` — drop straight into the REPL via the chat
+        # subcommand with no message. Most CLIs print help here, but
+        # interactive tools (psql, python, node) open a REPL and that's
+        # the natural shape for this one.
+        argv = ["chat"]
+    elif argv[0] not in subcommand_names and not argv[0].startswith("-"):
+        # Implicit chat: anything that isn't a subcommand name and
+        # doesn't look like a flag becomes a chat message. We let the
+        # chat subparser collect the words via ``nargs="*"`` rather
+        # than joining here, so explicit (``pepper chat hi there``)
+        # and implicit (``pepper hi there``) forms route through the
+        # same path.
+        if (rc := _reject_command_typo(argv[0], subcommand_names)) is not None:
+            return rc
+        argv = ["chat", *argv]
+    # Anything starting with ``-`` (``--help``, ``--version``, unknown
+    # flags) flows straight to the top-level argparse so flag-style
+    # errors and help text stay sensible.
+
+    args = parser.parse_args(argv)
+    handler = args.handler
+    try:
+        return handler(args)
+    except KeyboardInterrupt:
+        # Ctrl-C inside an interactive prompt or a long-running turn.
+        # Print a newline so the next shell prompt isn't pasted onto
+        # the same line as the partial output.
+        render.info("")
+        return 130
+
+
+def _consume_profile(argv: list[str]) -> tuple[str | None, list[str]]:
+    """Strip a leading ``--profile NAME`` / ``--profile=NAME`` from ``argv``.
+
+    Only the leading position counts, so the command text always starts
+    ``pepper --profile NAME …`` (what a permission rule matches on). Raises
+    ``ValueError`` for a missing or illegal name.
+    """
+    if not argv:
+        return None, argv
+    first = argv[0]
+    if first == "--profile":
+        if len(argv) < 2:
+            raise ValueError("--profile requires a profile name.")
+        name, rest = argv[1], argv[2:]
+    elif first.startswith("--profile="):
+        name, rest = first.removeprefix("--profile="), argv[1:]
+    else:
+        return None, argv
+    return credentials.validate_profile(name), rest
+
+
+class _RejectUnappliedProfile(argparse.Action):
+    """Fail closed on any profile option that reaches argparse.
+
+    :func:`_consume_profile` has already taken the single leading
+    ``--profile NAME`` by the time the parser runs, so anything argparse
+    matches to this option — a prefix abbreviation (``--prof``), a second
+    ``--profile``, one placed after another top-level flag — would be accepted
+    and then dropped, running the command as the wrong login. Exit 2 instead.
+    """
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: object,
+        option_string: str | None = None,
+    ) -> None:
+        del namespace, values
+        parser.error(
+            f"{option_string or '--profile'} was not applied: give --profile NAME "
+            "exactly once, spelled in full, as the first argument "
+            "(pepper --profile NAME <command> ...)."
+        )
+
+
+def _reject_command_typo(first: str, subcommand_names: frozenset[str]) -> int | None:
+    """Guard implicit chat: return exit code 2 (after a stderr hint) when ``first``
+    looks like a mistyped command, or when ``PEPPER_NO_IMPLICIT_CHAT`` is set.
+
+    zsh doesn't word-split ``$var``, so ``pepper "todos add"`` arrives as one
+    word; its first token is checked too. Returns ``None`` to let chat proceed.
+    """
+    # Truthy-looking values only: "0"/"false"/"" leave implicit chat on.
+    disabled = os.environ.get("PEPPER_NO_IMPLICIT_CHAT", "").strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+    )
+    tokens = first.split()
+    head = tokens[0] if tokens else first
+    guess: str | None = None
+    if len(tokens) > 1 and head in subcommand_names:
+        guess = head
+    elif close := difflib.get_close_matches(head.lower(), sorted(subcommand_names), 1, 0.8):
+        guess = close[0]
+    if guess is None and not disabled:
+        return None
+    suggestion = f" Did you mean '{guess}'?" if guess else ""
+    print(
+        f"pepper: unknown command '{first}'.{suggestion} "
+        "To send it to Pepper as a message, use: pepper chat …",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def _build_parser() -> tuple[argparse.ArgumentParser, frozenset[str]]:
+    """Construct the argparse parser and return it alongside the
+    frozen set of subcommand names registered on it.
+
+    Returning the set here (rather than maintaining a separate
+    ``_SUBCOMMANDS`` constant) keeps the implicit-chat dispatch in
+    :func:`main` in sync with whatever subparsers we declare — new
+    commands added to this function are automatically excluded from
+    the chat fallback without a second edit.
+    """
+    parser = argparse.ArgumentParser(
+        prog="pepper",
+        description=(
+            "Pepper CLI — chat with your agent over /api/v1. "
+            "Bare ``pepper`` opens the REPL; ``pepper <message>`` is shorthand "
+            "for ``pepper chat <message>``. Use a subcommand "
+            "(login / whoami / chat / trajectory / todos / scheduled-tasks / "
+            "skills / groups / notes / agent-skill / logout) for everything else."
+        ),
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    # :func:`main` consumes the one leading ``--profile`` before parsing (it
+    # must precede implicit-chat dispatch). It is declared here so ``--help``
+    # documents it, with an action that refuses: whatever argparse still
+    # resolves to this option was not applied, and must not be ignored.
+    parser.add_argument(
+        "--profile",
+        action=_RejectUnappliedProfile,
+        default=argparse.SUPPRESS,
+        metavar="NAME",
+        help=(
+            "Use a separate login stored under <config>/pepper/profiles/NAME/ "
+            "(e.g. an agent token). Must come before the subcommand."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_login = sub.add_parser("login", help="Store credentials for a Pepper server.")
+    p_login.add_argument(
+        "--server",
+        help=f"Server base URL (default: {_DEFAULT_SERVER}). Stored in the credentials file.",
+    )
+    p_login.add_argument(
+        "--token",
+        help=(
+            "Personal access token — skips the browser device-login flow entirely "
+            "(scripting / CI). Mint one at <server>/settings#tokens."
+        ),
+    )
+    p_login.add_argument(
+        "--manual",
+        action="store_true",
+        help=(
+            "Force the interactive manual-token prompt instead of the browser "
+            "device-login flow (reads without echoing)."
+        ),
+    )
+    p_login.add_argument(
+        "--no-browser",
+        action="store_true",
+        help=(
+            "Device-login flow only: don't automatically open the verification URL "
+            "in a browser (it's still printed)."
+        ),
+    )
+    p_login.set_defaults(handler=cmd_login)
+
+    p_whoami = sub.add_parser("whoami", help="Print the user behind the current credentials.")
+    p_whoami.set_defaults(handler=cmd_whoami)
+
+    p_chat = sub.add_parser(
+        "chat",
+        help="Send one message (one-shot) or open the interactive REPL when no message is given.",
+    )
+    # ``nargs="*"`` so ``pepper chat hi there`` (unquoted) joins
+    # cleanly into a single message — same shape the implicit-chat
+    # dispatch in :func:`main` produces. An empty list (``pepper`` or
+    # ``pepper chat``) drops into the REPL.
+    p_chat.add_argument(
+        "message",
+        nargs="*",
+        help="Message to send. Multi-word OK without quotes. Omit to open the interactive REPL.",
+    )
+    # Client-provided tools. Repeatable:
+    # ``--root ~/notes --root ~/work``. Each one grants read-only access to
+    # that folder **for the length of this invocation**, enforced here rather
+    # than on the server — the server never learns what a root is, and a
+    # tool takes no root argument, so the grant cannot be widened from the
+    # other end.
+    #
+    # ``--tools-root`` is an accepted alias for ``--root``: both work rather
+    # than picking one and stranding whoever read the other.
+    p_chat.add_argument(
+        "--root",
+        "--tools-root",
+        action="append",
+        dest="root",
+        metavar="PATH",
+        help=(
+            "Let this turn read files under PATH on this machine (repeatable). "
+            "Read-only; the search runs here and only matches are sent."
+        ),
+    )
+    p_chat.set_defaults(handler=cmd_chat)
+
+    p_traj = sub.add_parser(
+        "trajectory",
+        help=(
+            "Inspect saved trajectories you own (or share via a group). "
+            "Use ``show <id>`` for one turn, ``list`` for recent turns."
+        ),
+    )
+    # Nested subparser: ``pepper trajectory show ...`` / ``... list``.
+    # ``required=True`` so ``pepper trajectory`` alone prints help rather
+    # than silently doing nothing.
+    sub_traj = p_traj.add_subparsers(dest="trajectory_action", required=True)
+    p_traj_show = sub_traj.add_parser("show", help="Print one trajectory's events.")
+    p_traj_show.add_argument("trajectory_id", help="Trajectory UUID.")
+    p_traj_show.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the raw JSON response (full payloads, no truncation).",
+    )
+    p_traj_show.set_defaults(handler=cmd_trajectory_show)
+    p_traj_list = sub_traj.add_parser("list", help="List your recent trajectories.")
+    p_traj_list.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Number of rows (default 20, max 200).",
+    )
+    p_traj_list.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Skip this many rows. Use for paging.",
+    )
+    p_traj_list.set_defaults(handler=cmd_trajectory_list)
+
+    p_cal = sub.add_parser(
+        "calendar",
+        help="Read-only agenda: today, a week, or any window.",
+        description=(
+            "Show your calendar as a per-day agenda with weather, daylight and commute. "
+            "today (the default), week and schedule are shortcuts; --start/--days pick any "
+            "window (1-31 days)."
+        ),
+    )
+    p_cal.add_argument(
+        "window",
+        nargs="?",
+        choices=["today", "week", "schedule"],
+        help="today (default), week, or schedule (events plus timed todo deadlines).",
+    )
+    p_cal.add_argument("--start", help="First day, YYYY-MM-DD (default: today).")
+    p_cal.add_argument("--days", type=int, help="Number of days, 1-31 (default: 1; week = 7).")
+    p_cal.add_argument(
+        "--planning",
+        action="store_true",
+        help="Add Planning: followed events, email suggestions, meal windows, suggestion cards "
+        "(max 7 days).",
+    )
+    p_cal.add_argument("--json", action="store_true", help="Emit the raw JSON response.")
+    p_cal.set_defaults(handler=cmd_calendar)
+
+    p_next = sub.add_parser(
+        "next",
+        help="What to do next: Now, Do next, Due soon, Later (read-only).",
+        description=(
+            "Assemble Pepper's Schedule plan, due dates and Planning's email deadlines into one "
+            "list. Reads only; the order is Pepper's, not re-ranked here."
+        ),
+    )
+    p_next.add_argument(
+        "--room", help="Only items whose room or source starts with this (case-insensitive)."
+    )
+    p_next.add_argument(
+        "--first",
+        choices=["urgent", "important", "fast"],
+        help="Show Do next from this Pepper plan instead of Pepper's choice (read-only).",
+    )
+    p_next.add_argument("--all", action="store_true", help="List every Later item.")
+    p_next.add_argument("--json", action="store_true", help="Emit the assembled result as JSON.")
+    p_next.set_defaults(handler=cmd_next)
+
+    p_todos = sub.add_parser(
+        "todos",
+        help=(
+            "Your tracked action items. ``list`` to see them, ``add`` to create, "
+            "``done``/``dismiss`` to close one."
+        ),
+    )
+    # Nested subparser: ``pepper todos list`` / ``add`` / ``done`` /
+    # ``dismiss``. ``required=True`` so bare ``pepper todos`` prints help.
+    sub_todos = p_todos.add_subparsers(dest="todos_action", required=True)
+
+    p_todos_list = sub_todos.add_parser("list", help="List your todos (open by default).")
+    p_todos_list.add_argument(
+        "--status",
+        choices=("open", "done", "dismissed", "all"),
+        default="open",
+        help="Which todos to show (default: open).",
+    )
+    p_todos_list.add_argument("--json", action="store_true", help="Emit the raw JSON response.")
+    p_todos_list.set_defaults(handler=cmd_todo_list)
+
+    p_todos_add = sub_todos.add_parser("add", help="Create a todo.")
+    # ``nargs="+"`` so ``pepper todos add buy milk`` joins unquoted words
+    # into one title, mirroring ``pepper chat``'s message handling.
+    p_todos_add.add_argument("title", nargs="+", help="The todo title. Multi-word OK.")
+    p_todos_add.add_argument("--details", help="Optional longer description (not with --room).")
+    p_todos_add.add_argument(
+        "--due",
+        help="Soft deadline: 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM' (your local time; "
+        "with --room, 'YYYY-MM-DD' only).",
+    )
+    p_todos_add.add_argument(
+        "--priority", help="Free-form priority label, e.g. high (not with --room)."
+    )
+    p_todos_add.set_defaults(handler=cmd_todo_add)
+
+    for name, handler, text in (
+        ("done", cmd_todo_done, "Mark a todo done, as ticking it on Schedule does."),
+        ("dismiss", cmd_todo_dismiss, "Dismiss a todo (close without completing)."),
+        ("reopen", cmd_todo_reopen, "Put a done or dismissed todo back on the list."),
+    ):
+        p_todo = sub_todos.add_parser(name, help=text)
+        p_todo.add_argument("todo_id", help="Todo UUID (from ``todos list`` or ``next --json``).")
+        p_todo.set_defaults(handler=handler)
+    for name in ("list", "add", "done", "dismiss", "reopen"):
+        sub_todos.choices[name].add_argument(
+            "--room", help=_GROUP_ARG_HELP + " Acts on the room's todos instead of yours."
+        )
+
+    p_tasks = sub.add_parser(
+        "scheduled-tasks",
+        help=(
+            "Your scheduled prompts. ``list``/``show``/``runs``/``thread`` to "
+            "inspect, ``add``/``edit`` to change one, ``pause``/``resume`` to "
+            "take it off and put it back on the schedule."
+        ),
+    )
+    sub_tasks = p_tasks.add_subparsers(dest="scheduled_tasks_action", required=True)
+
+    p_tasks_list = sub_tasks.add_parser("list", help="List your scheduled tasks (active only).")
+    p_tasks_list.add_argument(
+        "--all",
+        action="store_true",
+        help="Include paused tasks and spent one-offs.",
+    )
+    p_tasks_list.set_defaults(handler=cmd_scheduled_task_list)
+
+    p_tasks_show = sub_tasks.add_parser("show", help="Show one task's config and its last run.")
+    p_tasks_show.add_argument("task", help=_TASK_ARG_HELP)
+    p_tasks_show.set_defaults(handler=cmd_scheduled_task_show)
+
+    p_tasks_runs = sub_tasks.add_parser("runs", help="A task's fire history, newest first.")
+    p_tasks_runs.add_argument("task", help=_TASK_ARG_HELP)
+    p_tasks_runs.add_argument(
+        "--limit", type=int, default=20, help="Number of runs (default 20, max 100)."
+    )
+    p_tasks_runs.set_defaults(handler=cmd_scheduled_task_runs)
+
+    p_tasks_thread = sub_tasks.add_parser(
+        "thread", help="A task's own conversation (its results and your replies)."
+    )
+    p_tasks_thread.add_argument("task", help=_TASK_ARG_HELP)
+    p_tasks_thread.add_argument(
+        "--limit", type=int, default=20, help="Number of messages (default 20, max 100)."
+    )
+    p_tasks_thread.set_defaults(handler=cmd_scheduled_task_thread)
+
+    p_tasks_add = sub_tasks.add_parser(
+        "add",
+        help="Schedule a new task. Pass exactly one of --cron or --at.",
+    )
+    p_tasks_add.add_argument(
+        "name", help="Slug for the task (lowercase letters, digits, hyphens; 1-64 chars)."
+    )
+    p_tasks_add.add_argument(
+        "--prompt",
+        required=True,
+        help=(
+            "What the agent should do when it fires, written as if you were "
+            "asking at that moment. Don't include delivery instructions — "
+            "that's --to's job."
+        ),
+    )
+    p_tasks_add.add_argument("--cron", help="Five-field cron for a recurring task ('0 8 * * 1-5').")
+    p_tasks_add.add_argument(
+        "--at",
+        help=(
+            "One-off fire time: 'YYYY-MM-DD HH:MM' in your local time. "
+            "Mutually exclusive with --cron."
+        ),
+    )
+    p_tasks_add.add_argument(
+        "--timezone",
+        help="IANA zone the cron fires in, pinned (default: your profile zone). Cron tasks only.",
+    )
+    p_tasks_add.add_argument("--description", help="Short label shown in listings.")
+    p_tasks_add.add_argument(
+        "--to",
+        action="append",
+        choices=_ANY_DESTINATION_CHOICES,
+        metavar="DEST",
+        help=(
+            "Where to announce the result; repeatable. Choices: "
+            f"{', '.join(_DESTINATION_CHOICES)}. Omit to use your default "
+            f"notification channel. With --room: {', '.join(_ROOM_DESTINATION_CHOICES)}; "
+            "omit to let the server pick the room's delivery."
+        ),
+    )
+    p_tasks_add.add_argument(
+        "--silent",
+        action="store_true",
+        help="Announce nowhere — the result still lands in the task's own thread.",
+    )
+    p_tasks_add.set_defaults(handler=cmd_scheduled_task_add)
+
+    p_tasks_edit = sub_tasks.add_parser(
+        "edit",
+        help="Change an existing task. Only the flags you pass are written.",
+    )
+    p_tasks_edit.add_argument("task", help=_TASK_ARG_HELP)
+    p_tasks_edit.add_argument("--prompt", help="Replace what the agent does when it fires.")
+    p_tasks_edit.add_argument("--cron", help="New cron (recurring tasks only).")
+    p_tasks_edit.add_argument("--at", help="New fire time, local (one-off tasks only).")
+    p_tasks_edit.add_argument("--timezone", help="New pinned zone (recurring tasks only).")
+    p_tasks_edit.add_argument("--description", help="Replace the label.")
+    p_tasks_edit.add_argument(
+        "--clear-description",
+        action="store_true",
+        help="Remove the label entirely (distinct from leaving it alone).",
+    )
+    p_tasks_edit.set_defaults(handler=cmd_scheduled_task_edit)
+
+    p_tasks_pause = sub_tasks.add_parser(
+        "pause",
+        help="Take a task off the schedule. Its history is kept and it can be resumed.",
+    )
+    p_tasks_pause.add_argument("task", help=_TASK_ARG_HELP)
+    p_tasks_pause.set_defaults(handler=cmd_scheduled_task_pause)
+
+    p_tasks_resume = sub_tasks.add_parser(
+        "resume", help="Put a paused task back on the schedule, next fire re-derived."
+    )
+    p_tasks_resume.add_argument("task", help=_TASK_ARG_HELP)
+    p_tasks_resume.set_defaults(handler=cmd_scheduled_task_resume)
+
+    p_tasks_dest = sub_tasks.add_parser(
+        "destinations",
+        help="Set where a task announces its results (replaces the whole set).",
+    )
+    p_tasks_dest.add_argument("task", help=_TASK_ARG_HELP)
+    p_tasks_dest.add_argument(
+        "--to",
+        action="append",
+        choices=_ANY_DESTINATION_CHOICES,
+        metavar="DEST",
+        help=(
+            f"Repeatable. Choices: {', '.join(_DESTINATION_CHOICES)}. "
+            f"With --room: {', '.join(_ROOM_DESTINATION_CHOICES)}."
+        ),
+    )
+    p_tasks_dest.add_argument(
+        "--default",
+        action="store_true",
+        dest="use_default",
+        help="Follow your notification preference instead of a pinned set. Not with --room.",
+    )
+    p_tasks_dest.add_argument(
+        "--silent",
+        action="store_true",
+        help="Announce nowhere. Distinct from --default: a later change to your "
+        "notification preference won't un-silence it.",
+    )
+    p_tasks_dest.set_defaults(handler=cmd_scheduled_task_destinations)
+    for name in ("list", "add", "pause", "resume", "destinations"):
+        sub_tasks.choices[name].add_argument(
+            "--room",
+            help=(
+                _GROUP_ARG_HELP + " Acts on the room's scheduled tasks instead of yours. "
+                "Any member can list them; only a room owner can change them."
+            ),
+        )
+    for name in ("add", "destinations"):
+        sub_tasks.choices[name].add_argument(
+            "--topic",
+            metavar="NAME",
+            help=(
+                "With --room and --to groups_service: the name of the room topic "
+                "the result is posted into."
+            ),
+        )
+
+    p_skills = sub.add_parser(
+        "skills",
+        help=(
+            "Your skill library. ``list``/``show`` to inspect, ``new``/``edit`` "
+            "to author in $EDITOR, ``delete`` to remove one of yours. "
+            "``share``/``revoke`` with --room put one in a room or take it out."
+        ),
+    )
+    sub_skills = p_skills.add_subparsers(dest="skills_action", required=True)
+
+    p_skills_list = sub_skills.add_parser("list", help="List your skills and Pepper's built-ins.")
+    p_skills_list.set_defaults(handler=cmd_skills_list)
+
+    p_skills_show = sub_skills.add_parser("show", help="Print one skill as SKILL.md.")
+    p_skills_show.add_argument("name", help="Skill name (from ``skills list``).")
+    p_skills_show.set_defaults(handler=cmd_skills_show)
+
+    p_skills_new = sub_skills.add_parser("new", help="Author a new skill in $EDITOR and save it.")
+    p_skills_new.add_argument("name", help="Slug name for the new skill.")
+    p_skills_new.set_defaults(handler=cmd_skills_new)
+
+    p_skills_edit = sub_skills.add_parser(
+        "edit",
+        help=(
+            "Edit a skill in $EDITOR. Editing a built-in creates a shadowing "
+            "override on your account."
+        ),
+    )
+    p_skills_edit.add_argument("name", help="Skill name (from ``skills list``).")
+    p_skills_edit.set_defaults(handler=cmd_skills_edit)
+
+    p_skills_delete = sub_skills.add_parser(
+        "delete", help="Delete one of YOUR skills (built-ins can't be deleted)."
+    )
+    p_skills_delete.add_argument("name", help="Skill name (from ``skills list``).")
+    p_skills_delete.add_argument("--yes", action="store_true", help="Skip the confirmation prompt.")
+    p_skills_delete.set_defaults(handler=cmd_skills_delete)
+
+    p_skills_share = sub_skills.add_parser(
+        "share",
+        help=(
+            "Share one of YOUR skills with a room. The room gets a live reference, "
+            "not a copy: your later edits show there too."
+        ),
+    )
+    p_skills_share.add_argument("name", help="Name of one of your own skills.")
+    p_skills_share.add_argument("--room", required=True, help=_GROUP_ARG_HELP)
+    p_skills_share.set_defaults(handler=cmd_skills_share)
+
+    p_skills_revoke = sub_skills.add_parser(
+        "revoke",
+        help=(
+            "Stop sharing a skill with a room. The skill itself is untouched. "
+            "Its owner can always do this; a room owner can in a channel."
+        ),
+    )
+    p_skills_revoke.add_argument("name", help=_ROOM_SKILL_ARG_HELP)
+    p_skills_revoke.add_argument("--room", required=True, help=_GROUP_ARG_HELP)
+    p_skills_revoke.set_defaults(handler=cmd_skills_revoke)
+
+    for name in ("list", "show"):
+        sub_skills.choices[name].add_argument(
+            "--room",
+            help=(
+                _GROUP_ARG_HELP + " Reads the skills shared with the room instead of "
+                "your own library. Any member can."
+            ),
+        )
+    for name in ("new", "edit", "delete"):
+        # Accepted so the refusal can explain itself (exit 2) instead of
+        # argparse's "unrecognized arguments".
+        sub_skills.choices[name].add_argument(
+            "--room",
+            help="Not available: a room never owns a skill. See ``skills share``.",
+        )
+
+    p_groups = sub.add_parser(
+        "groups",
+        help=(
+            "Your rooms/channels. ``list``/``show``/``topics``/``read`` to "
+            "inspect, ``post`` to send a message."
+        ),
+    )
+    sub_groups = p_groups.add_subparsers(dest="groups_action", required=True)
+
+    p_groups_list = sub_groups.add_parser("list", help="List your rooms (unarchived by default).")
+    p_groups_list.add_argument(
+        "--archived", action="store_true", help="List only archived rooms, instead of the default."
+    )
+    p_groups_list.add_argument("--json", action="store_true", help="Emit the raw JSON response.")
+    p_groups_list.set_defaults(handler=cmd_groups_list)
+
+    p_groups_show = sub_groups.add_parser(
+        "show", help="One room's info: kind, members + roles, topics, installed apps."
+    )
+    p_groups_show.add_argument("group", help=_GROUP_ARG_HELP)
+    p_groups_show.set_defaults(handler=cmd_groups_show)
+
+    p_groups_topics = sub_groups.add_parser("topics", help="List a room's topics.")
+    p_groups_topics.add_argument("group", help=_GROUP_ARG_HELP)
+    p_groups_topics.add_argument(
+        "--archived", action="store_true", help="Include archived topics (folded by default)."
+    )
+    p_groups_topics.add_argument("--json", action="store_true", help="Emit the raw JSON response.")
+    p_groups_topics.set_defaults(handler=cmd_groups_topics)
+
+    p_groups_roster = sub_groups.add_parser(
+        "roster",
+        help="A room's addressable members (person ids for --mention), Pepper first.",
+    )
+    p_groups_roster.add_argument("group", help=_GROUP_ARG_HELP)
+    p_groups_roster.add_argument("--json", action="store_true", help="Emit the raw JSON response.")
+    p_groups_roster.set_defaults(handler=cmd_groups_roster)
+
+    p_groups_read = sub_groups.add_parser("read", help="Read a topic's messages, oldest to newest.")
+    p_groups_read.add_argument("group", help=_GROUP_ARG_HELP)
+    p_groups_read.add_argument(
+        "topic",
+        nargs="?",
+        help=_TOPIC_ARG_HELP + " Omit for the room's default topic.",
+    )
+    p_groups_read.add_argument(
+        "--limit", type=int, default=None, help="Max messages to return (server default/cap apply)."
+    )
+    p_groups_read_page = p_groups_read.add_mutually_exclusive_group()
+    p_groups_read_page.add_argument(
+        "--before", help="Page cursor: messages older than this (a previous 'more' cursor)."
+    )
+    p_groups_read_page.add_argument(
+        "--since", help="Only messages newer than this cursor/timestamp."
+    )
+    p_groups_read.add_argument("--json", action="store_true", help="Emit the raw JSON response.")
+    p_groups_read.add_argument(
+        "--mark", action="store_true", help="Then mark the topic read through its newest message."
+    )
+    p_groups_read.set_defaults(handler=cmd_groups_read)
+
+    p_groups_post = sub_groups.add_parser("post", help="Post a message into a topic, as yourself.")
+    p_groups_post.add_argument("group", help=_GROUP_ARG_HELP)
+    p_groups_post.add_argument("topic", help=_TOPIC_ARG_HELP)
+    p_groups_post.add_argument(
+        "message",
+        nargs="*",
+        help=(
+            "Message text. Multi-word OK without quotes. "
+            "Pass '-' alone to read the body from stdin."
+        ),
+    )
+    p_groups_post.add_argument(
+        "--attach",
+        action="append",
+        metavar="PATH",
+        help="Attach a file; repeatable. Uploaded before the message is posted.",
+    )
+    p_groups_post.add_argument(
+        "--reply-to",
+        metavar="MESSAGE_ID",
+        help="Thread the post onto this message (its id, from 'groups read --json').",
+    )
+    p_groups_post.add_argument(
+        "--mention",
+        action="append",
+        metavar="PERSON_ID",
+        help=(
+            "Structurally mention this person id (from 'groups roster'); repeatable. "
+            "Keep their '@Display Name' in the message text."
+        ),
+    )
+    p_groups_post.add_argument(
+        "--on-behalf-of",
+        metavar="PERSON_ID",
+        help=(
+            "Agent tokens only: post as answering this person id, so the room shows "
+            "the reply 'for' them. Needs --reply-to naming their message."
+        ),
+    )
+    p_groups_post.add_argument(
+        "--idempotency-key",
+        metavar="KEY",
+        help=(
+            "Send this Idempotency-Key instead of a fresh one, so re-running the same "
+            "command cannot post twice (e.g. the id of the message being answered)."
+        ),
+    )
+    p_groups_post.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Print the created message as one JSON object (the shape 'groups read --json' "
+            "uses for a message, plus topic_id) instead of 'Posted.' and the id."
+        ),
+    )
+    p_groups_post.set_defaults(handler=cmd_groups_post)
+
+    p_groups_watch = sub_groups.add_parser(
+        "watch",
+        help="Stream your rooms' events as an agent member (one line per event).",
+        description=(
+            "Follow the event stream of the agent whose token you are signed in with "
+            "(a pep_agt_ token). Prints one line per event, reconnecting from the last "
+            "cursor with backoff when the stream drops, and exits non-zero if the "
+            "token is revoked. Events carry ids, not message bodies: read a body "
+            "with 'groups read'."
+        ),
+    )
+    p_groups_watch.add_argument(
+        "--since",
+        type=int,
+        default=None,
+        metavar="CURSOR",
+        help="Resume after this cursor (an event id, or a cursor frame's value). "
+        "Default: the cursor file's, else the beginning.",
+    )
+    p_groups_watch.add_argument(
+        "--cursor-file",
+        default=None,
+        metavar="PATH",
+        help="Persist the cursor here (atomically, after each event is printed) and "
+        "start from it when --since is not given.",
+    )
+    p_groups_watch.add_argument(
+        "--json",
+        action="store_true",
+        help='One JSON object per line: the event\'s fields plus "cursor"; a cursor '
+        'frame is {"kind": "cursor", "cursor": N}.',
+    )
+    p_groups_watch.add_argument(
+        "--kinds",
+        type=_kind_list,
+        default=None,
+        metavar="KIND[,KIND...]",
+        help="Only print events of these kinds (comma-separated, e.g. "
+        "message.created,mention.created); every other event is skipped but the "
+        "cursor still moves past it. Default: all kinds.",
+    )
+    p_groups_watch.add_argument(
+        "--ignore-kinds",
+        type=_kind_list,
+        default=None,
+        metavar="KIND[,KIND...]",
+        help="Skip events of these kinds (comma-separated, e.g. "
+        "message.link_cards_updated); the cursor still moves past them. Kinds not "
+        "listed, including ones added later, still print. Combines with --kinds.",
+    )
+    p_groups_watch.set_defaults(handler=cmd_groups_watch)
+
+    def groups_cmd(
+        name: str, handler: Callable[[argparse.Namespace], int], text: str, *pos: tuple[str, str]
+    ) -> argparse.ArgumentParser:
+        p = sub_groups.add_parser(name, help=text)
+        p.add_argument("group", help=_GROUP_ARG_HELP)
+        for arg, arg_help in pos:
+            p.add_argument(arg, help=arg_help)
+        p.set_defaults(handler=handler)
+        return p
+
+    def words(p: argparse.ArgumentParser, dest: str, text: str) -> None:
+        p.add_argument(dest, nargs="+", help=text)
+
+    _mid = ("message", "Message id (from 'groups read --json').")
+    _yes = "Skip the confirmation (required when not on a terminal)."
+
+    p = groups_cmd("edit", cmd_groups_edit, "Edit one of your messages.", _mid)
+    words(p, "text", "The new message text.")
+    p = groups_cmd(
+        "delete-message", cmd_groups_delete_message, "Delete one of your messages.", _mid
+    )
+    p.add_argument("--yes", action="store_true", help=_yes)
+    groups_cmd("react", cmd_groups_react, "React to a message.", _mid, ("emoji", "The emoji."))
+    groups_cmd(
+        "unreact", cmd_groups_unreact, "Take your reaction back.", _mid, ("emoji", "The emoji.")
+    )
+    p = groups_cmd(
+        "download",
+        cmd_groups_download,
+        "Download a message attachment.",
+        ("attachment", "Attachment id (from 'groups read --json')."),
+    )
+    p.add_argument(
+        "--out", required=True, metavar="PATH", help="Where to write it; '-' for stdout."
+    )
+
+    p = groups_cmd("new-topic", cmd_groups_new_topic, "Start a topic in a room.")
+    words(p, "name", "The topic name.")
+    p = groups_cmd(
+        "rename-topic", cmd_groups_rename_topic, "Rename a topic.", ("topic", _TOPIC_ARG_HELP)
+    )
+    words(p, "name", "The new name.")
+    groups_cmd(
+        "archive-topic", cmd_groups_archive_topic, "Archive a topic.", ("topic", _TOPIC_ARG_HELP)
+    )
+    groups_cmd(
+        "unarchive-topic",
+        cmd_groups_unarchive_topic,
+        "Unarchive a topic.",
+        ("topic", _TOPIC_ARG_HELP),
+    )
+
+    p = sub_groups.add_parser("new", help="Create a room. With --name it is an open room.")
+    p.add_argument("--name", help="Room name; omit for a conversation of exactly these people.")
+    p.add_argument(
+        "people", nargs="+", help="Email, phone, or a contact's name (looked up in your Contacts)."
+    )
+    p.set_defaults(handler=cmd_groups_new)
+    p = groups_cmd("rename", cmd_groups_rename, "Rename a room.")
+    words(p, "name", "The new room name.")
+    p = groups_cmd("archive", cmd_groups_archive, "Archive a room (your view only).")
+    p.add_argument("--yes", action="store_true", help=_yes)
+    groups_cmd("unarchive", cmd_groups_unarchive, "Unarchive a room.")
+    p = groups_cmd("leave", cmd_groups_leave, "Leave an open room.")
+    p.add_argument("--yes", action="store_true", help=_yes)
+    groups_cmd("mute", cmd_groups_mute, "Stop push notifications from a room (your devices only).")
+    groups_cmd("unmute", cmd_groups_unmute, "Resume push notifications from a room.")
+
+    p = groups_cmd(
+        "invite",
+        cmd_groups_invite,
+        "Invite someone to an open room.",
+        ("handle", "Email or phone."),
+    )
+    person_help = "A member's name (unique prefix OK) or person id (from 'groups roster')."
+    p = groups_cmd(
+        "remove", cmd_groups_remove, "Remove a member from a room.", ("person", person_help)
+    )
+    p.add_argument("--yes", action="store_true", help=_yes)
+    p = groups_cmd(
+        "role",
+        cmd_groups_role,
+        "Make someone an owner, or a plain member.",
+        ("person", person_help),
+    )
+    p.add_argument("role", choices=("owner", "member"))
+    p.add_argument("--yes", action="store_true", help=_yes)
+
+    p = groups_cmd("apps", cmd_groups_apps, "A room's apps, and the ones you can install.")
+    p.add_argument("--json", action="store_true", help="Emit the launcher tiles as JSON.")
+    groups_cmd(
+        "install-app",
+        cmd_groups_install_app,
+        "Install an app in a room.",
+        ("app_key", "App key (see 'groups apps')."),
+    )
+    p = groups_cmd(
+        "uninstall-app",
+        cmd_groups_uninstall_app,
+        "Uninstall an app from a room.",
+        ("app", "Installed app's key, title or install id."),
+    )
+    p.add_argument("--yes", action="store_true", help=_yes)
+
+    p = groups_cmd("sharing", cmd_groups_sharing, "Which of your calendars this room sees.")
+    p.add_argument(
+        "--set",
+        action="append",
+        metavar="CALENDAR=LEVEL",
+        help="Set a calendar (name or id) to a level; repeatable. Calendars not named keep theirs.",
+    )
+    p.add_argument("--json", action="store_true", help="Emit the sharing record as JSON.")
+
+    p = sub_groups.add_parser("activity", help="Newest messages from others in your rooms' topics.")
+    p.add_argument("group", nargs="?", help=_GROUP_ARG_HELP + " Omit for all your rooms.")
+    p.add_argument("--since", help="ISO timestamp (default: 24 hours ago).")
+    p.add_argument("--json", action="store_true", help="Emit the raw JSON response.")
+    p.set_defaults(handler=cmd_groups_activity)
+    p = sub_groups.add_parser("search", help="Find topics by name across your unarchived rooms.")
+    p.add_argument("query")
+    p.add_argument("--json", action="store_true", help="Emit the raw JSON response.")
+    p.set_defaults(handler=cmd_groups_search)
+
+    p_notes = sub.add_parser(
+        "notes",
+        help=(
+            "Your text artifacts. ``list``/``search`` to find one, ``show`` "
+            "to print it, ``new``/``edit``/``rm`` to write it. ``--room`` "
+            "scopes to a room's shared notes instead of your own."
+        ),
+    )
+    sub_notes = p_notes.add_subparsers(dest="notes_action", required=True)
+
+    p_notes_list = sub_notes.add_parser("list", help="List your notes (or a room's, with --room).")
+    p_notes_list.add_argument("--room", help=_GROUP_ARG_HELP + " Omit for your own notes.")
+    p_notes_list.add_argument("--label", help="Only notes carrying this label.")
+    p_notes_list.add_argument("--json", action="store_true", help="Emit the raw JSON response.")
+    p_notes_list.set_defaults(handler=cmd_notes_list)
+
+    p_notes_search = sub_notes.add_parser(
+        "search", help="Case-insensitive substring search over note names and bodies."
+    )
+    p_notes_search.add_argument(
+        "query", nargs="+", help="Search text. Multi-word OK without quotes."
+    )
+    p_notes_search.add_argument("--room", help=_GROUP_ARG_HELP + " Omit for your own notes.")
+    p_notes_search.add_argument("--label", help="Only notes carrying this label.")
+    p_notes_search.add_argument("--json", action="store_true", help="Emit the raw JSON response.")
+    p_notes_search.set_defaults(handler=cmd_notes_search)
+
+    p_notes_show = sub_notes.add_parser("show", help="Print one note's markdown body to stdout.")
+    p_notes_show.add_argument("note", help=_NOTE_ARG_HELP)
+    p_notes_show.add_argument("--room", help=_GROUP_ARG_HELP + " Omit for your own notes.")
+    p_notes_show.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the full detail as JSON (name, labels, etag, ...) instead of the raw body.",
+    )
+    p_notes_show.set_defaults(handler=cmd_notes_show)
+
+    p_notes_new = sub_notes.add_parser(
+        "new",
+        help="Create a note. Body from $EDITOR, --file PATH, or --file - for stdin.",
+    )
+    p_notes_new.add_argument("name", help="The new note's name.")
+    p_notes_new.add_argument(
+        "--room", help=_GROUP_ARG_HELP + " Save into a room's shared notes instead of your own."
+    )
+    p_notes_new.add_argument(
+        "--file", help="Read the body from this path, or '-' to read stdin, instead of $EDITOR."
+    )
+    p_notes_new.set_defaults(handler=cmd_notes_new)
+
+    p_notes_edit = sub_notes.add_parser(
+        "edit",
+        help="Edit a note. Body from $EDITOR, --file PATH, or --file - for stdin.",
+    )
+    p_notes_edit.add_argument("note", help=_NOTE_ARG_HELP)
+    p_notes_edit.add_argument("--room", help=_GROUP_ARG_HELP + " Omit for your own notes.")
+    p_notes_edit.add_argument(
+        "--file",
+        help="Read the new body from this path, or '-' to read stdin, instead of $EDITOR.",
+    )
+    p_notes_edit.add_argument("--rename", metavar="NAME", help="Rename the note to NAME.")
+    p_notes_edit_precondition = p_notes_edit.add_mutually_exclusive_group()
+    p_notes_edit_precondition.add_argument(
+        "--if-match",
+        metavar="ETAG",
+        help="Send this etag as If-Match instead of one freshly read from the server.",
+    )
+    p_notes_edit_precondition.add_argument(
+        "--force", action="store_true", help="Send no If-Match — last write wins."
+    )
+    p_notes_edit.set_defaults(handler=cmd_notes_edit)
+
+    p_notes_rm = sub_notes.add_parser("rm", help="Delete a note.")
+    p_notes_rm.add_argument("note", help=_NOTE_ARG_HELP)
+    p_notes_rm.add_argument("--room", help=_GROUP_ARG_HELP + " Omit for your own notes.")
+    p_notes_rm.add_argument("--yes", action="store_true", help="Skip the confirmation prompt.")
+    p_notes_rm.set_defaults(handler=cmd_notes_rm)
+
+    p_takeout = sub.add_parser(
+        "takeout",
+        help="Download a zip archive of everything Pepper holds about your account.",
+    )
+    p_takeout.add_argument(
+        "--out",
+        help=(
+            "Output file path (default: the server-suggested filename, "
+            "e.g. pepper-takeout-<you>-<timestamp>.zip)."
+        ),
+    )
+    p_takeout.set_defaults(handler=cmd_takeout)
+
+    p_logout = sub.add_parser("logout", help="Delete the credentials file.")
+    p_logout.set_defaults(handler=cmd_logout)
+
+    p_agent_skill = sub.add_parser(
+        "agent-skill",
+        help="Print the agent-usage guide (SKILL.md) for taking part in rooms as an agent member.",
+        description=(
+            "Print the SKILL.md that tells an agent member how to use this CLI in Pepper "
+            "rooms. It is shipped inside this binary, so it describes this version. Needs no "
+            "login and makes no network call. (Not 'pepper skills', which manages your "
+            "account's own skills.)"
+        ),
+    )
+    p_agent_skill.add_argument(
+        "--write",
+        metavar="DIR",
+        help="Write DIR/SKILL.md (creating DIR) instead of printing; refuses to overwrite.",
+    )
+    p_agent_skill.add_argument(
+        "--force", action="store_true", help="With --write: overwrite an existing SKILL.md."
+    )
+    p_agent_skill.set_defaults(handler=cmd_agent_skill)
+
+    # ``sub.choices`` is the public mapping of subparser name → parser
+    # that argparse exposes (``argparse.SubParsersAction.choices``).
+    # Freeze the keys so callers can't mutate the dispatch table by
+    # accident.
+    return parser, frozenset(sub.choices)
+
+
+# ---------------------------------------------------------------------------
+# Command handlers
+# Each handler accepts an ``argparse.Namespace`` and returns an exit code.
+
+
+def cmd_login(args: argparse.Namespace) -> int:
+    """Resolve the server URL, then dispatch to the device-login flow
+    (the default) or the manual paste-a-PAT flow (``--token`` /
+    ``--manual``)."""
+    server_url = args.server or _prompt(f"Server URL [{_DEFAULT_SERVER}]: ") or _DEFAULT_SERVER
+    server_url = server_url.rstrip("/")
+
+    if args.token or args.manual:
+        return _login_manual(server_url, args.token)
+    return _login_device(server_url, open_browser=not args.no_browser)
+
+
+def _login_manual(server_url: str, raw_token: str | None) -> int:
+    """Manual paste-a-PAT login: prompt if not given, validate, save.
+
+    This is the whole of ``cmd_login`` before the device-login flow
+    existed — kept verbatim as the ``--token`` (scripting) / ``--manual``
+    (force-prompt) fallback. A typo'd token fails loudly here rather
+    than silently breaking the next ``chat``.
+    """
+    raw_token = raw_token or _prompt_secret("Token (pep_pat_...): ")
+    if not raw_token:
+        render.error("No token provided. Mint one at <server>/settings#tokens and try again.")
+        return 2
+    # Wrap at the boundary: the raw string lives only inside this
+    # local until it's into the SecretStr, after which the unwrap
+    # path is grep-able via ``.get_secret_value()`` call sites.
+    token = SecretStr(raw_token)
+    is_agent = raw_token.startswith(AGENT_TOKEN_PREFIX)
+    del raw_token
+    if is_agent and credentials.active_profile() is None:
+        # Saving it would overwrite the person's own login in the default file.
+        render.error(
+            "Agent tokens (pep_agt_) must not replace your own login. "
+            "Re-run with a profile: pepper --profile <name> login ..."
+        )
+        return 2
+    if is_agent:
+        return _login_agent(server_url, token)
+
+    # Validate before saving — a typo'd token should fail loudly here,
+    # not silently break the next ``chat``. We close the client right
+    # away (no reuse: ``login`` is one-shot).
+    try:
+        with api_client.ApiClient(server_url=server_url, token=token) as api:
+            who = api.whoami()
+    except api_client.ApiError as exc:
+        if exc.status == 401:
+            render.error("Token rejected (401). Double-check what you pasted.")
+        else:
+            render.error(f"Server rejected the token: {exc}")
+        return 1
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {server_url}: {exc}")
+        return 1
+
+    path = credentials.save(server_url=server_url, token=token)
+    render.info(f"Logged in as [bold]{who.display_name}[/bold] ({who.email or 'no email'}).")
+    render.info(f"Credentials written to {path}.")
+    return 0
+
+
+#: An agent member's token. It authenticates as the agent, not a Pepper account, so it reaches
+#: only the room routes — ``whoami`` refuses it by design.
+AGENT_TOKEN_PREFIX = "pep_agt_"
+
+
+def _login_agent(server_url: str, token: SecretStr) -> int:
+    """Validate and save an agent token.
+
+    ``whoami`` answers only a Pepper account, so an agent token is checked
+    against ``GET /api/v1/groups`` instead — the one read every agent may
+    make — and saved the same way a PAT is. ``groups`` commands then work
+    as the agent; everything else answers 401.
+    """
+    try:
+        with api_client.ApiClient(server_url=server_url, token=token) as api:
+            rooms = api.list_groups()
+    except api_client.ApiError as exc:
+        if exc.status == 401:
+            render.error("Agent token rejected (401). It may be revoked or expired.")
+        else:
+            render.error(f"Server rejected the token: {exc}")
+        return 1
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {server_url}: {exc}")
+        return 1
+    # A 200 can still say the rooms surface is off or unreadable for this
+    # person; saving the token then would report a login that cannot work.
+    if not rooms.enabled:
+        render.error("Groups is not enabled on this server for that agent.")
+        return 1
+    if rooms.degraded:
+        render.error("The groups service could not read this agent's rooms. Try again shortly.")
+        return 1
+
+    path = credentials.save(server_url=server_url, token=token)
+    render.info(f"Logged in as an agent member of {rooms.total} room(s).")
+    render.info(f"Credentials written to {path}.")
+    return 0
+
+
+def _login_device(server_url: str, *, open_browser: bool) -> int:
+    """Browser-based device-authorization login (the default path).
+
+    Starts a device-authorization grant, prints the human code and
+    verification URL, opens the browser (unless suppressed), then polls
+    until the human approves/denies on the web page or the code expires.
+    Ctrl-C during the wait propagates as ``KeyboardInterrupt`` — caught
+    by :func:`main`, which prints a newline and returns 130, same as
+    everywhere else in the CLI.
+
+    On approval the server has already minted a PAT bound to this
+    device; it's validated via ``whoami()`` exactly like
+    :func:`_login_manual` before being saved, so a hiccup between mint
+    and poll-return is still caught here rather than landing silently
+    in the credentials file.
+    """
+    device_name = f"{getpass.getuser()}@{socket.gethostname()}"[:80]
+    try:
+        start = api_client.device_start(server_url, device_name)
+    except api_client.ApiError as exc:
+        render.error(f"Server rejected the device-login request: {exc}")
+        return 1
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {server_url}: {exc}")
+        return 1
+
+    render.info(f"Confirm this code in your browser: [bold]{start.user_code}[/bold]")
+    render.info(start.verification_url)
+    if open_browser:
+        # Best-effort only — a headless box / no default browser must
+        # never make the login fail; the URL is already printed above
+        # for the human to open by hand.
+        with contextlib.suppress(Exception):
+            webbrowser.open(start.verification_url)
+
+    interval = max(start.interval, 1)
+    deadline = time.monotonic() + start.expires_in
+
+    while True:
+        if time.monotonic() >= deadline:
+            render.error("Login expired before it was approved. Run 'pepper login' to try again.")
+            return 1
+        time.sleep(interval)
+        try:
+            poll = api_client.device_poll(server_url, start.device_code)
+        except api_client.ApiError as exc:
+            render.error(f"Server error while polling for login: {exc}")
+            return 1
+        except httpx.RequestError as exc:
+            render.error(f"Couldn't reach {server_url}: {exc}")
+            return 1
+
+        if poll.status == "pending":
+            continue
+        if poll.status == "slow_down":
+            # Back off: grow the CLI's own poll interval rather than
+            # trusting the server's suggested one blindly — a
+            # monotonically increasing local interval can't oscillate
+            # even if a buggy/mocked server sends inconsistent values.
+            interval += 5
+            continue
+        if poll.status == "denied":
+            render.error("Login was denied.")
+            return 1
+        if poll.status == "expired":
+            render.error("Login expired before it was approved. Run 'pepper login' to try again.")
+            return 1
+        if poll.status == "approved":
+            break
+        render.error(f"Unexpected response from server (status={poll.status!r}).")
+        return 1
+
+    assert poll.token is not None  # "approved" always carries a token
+    token = poll.token
+
+    try:
+        with api_client.ApiClient(server_url=server_url, token=token) as api:
+            who = api.whoami()
+    except api_client.ApiError as exc:
+        if exc.status == 401:
+            render.error("Token rejected (401) right after approval — run 'pepper login' again.")
+        else:
+            render.error(f"Server rejected the token: {exc}")
+        return 1
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {server_url}: {exc}")
+        return 1
+
+    path = credentials.save(server_url=server_url, token=token)
+    render.info(f"Logged in as [bold]{who.display_name}[/bold] ({who.email or 'no email'}).")
+    render.info(f"Credentials written to {path}.")
+    return 0
+
+
+def cmd_whoami(args: argparse.Namespace) -> int:
+    del args  # no flags
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            who = api.whoami()
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    # Plain print to stdout — scriptable.
+    print(f"user_id: {who.user_id}")
+    print(f"display_name: {who.display_name}")
+    print(f"email: {who.email or ''}")
+    print(f"timezone: {who.timezone or ''}")
+    return 0
+
+
+def cmd_chat(args: argparse.Namespace) -> int:
+    """Dispatch between one-shot ``chat MESSAGE`` and the REPL.
+
+    ``args.message`` is a list (``nargs="*"``) so both the explicit
+    (``pepper chat hi there``) and implicit (``pepper hi there``,
+    via :func:`main`'s preprocessing) forms route here identically.
+    An empty list opens the REPL; anything else joins to a single
+    message string for one-shot dispatch.
+    """
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        provider = _build_provider(getattr(args, "root", None))
+    except provider_fs.PathRefused as exc:
+        render.error(f"--root: {exc}")
+        return 2
+    message_parts = args.message or []
+    if not message_parts:
+        return _run_repl(creds, provider=provider)
+    message = " ".join(message_parts).strip()
+    if not message:
+        render.error("Empty message — nothing to send.")
+        return 2
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            # Stream one-shot turns too: a long turn can exceed the unary
+            # request timeout. trace=False keeps stdout to the final reply;
+            # provider=None sends no filesystem manifest or local tools.
+            return 0 if _stream_one_turn(api, message, provider=provider, trace=False) else 1
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.ReadTimeout:
+        render.error(
+            "Timed out waiting for Pepper's reply. The turn may still be running "
+            "or saved; check the web chat before sending the message again."
+        )
+        return 1
+    except httpx.RequestError as exc:
+        render.error(
+            f"Chat connection to {creds.server_url} failed: {exc}. "
+            "The turn may have been saved; check the web chat before retrying."
+        )
+        return 1
+
+
+def _build_provider(roots: list[str] | None) -> provider_fs.FilesystemProvider | None:
+    """The filesystem provider for this invocation, or ``None``.
+
+    ``None`` is the whole no-``--root`` contract: no manifest is sent, the
+    request body is byte-identical to what it was before this feature, and
+    ``pepper chat`` behaves exactly as it always has.
+    """
+    if not roots:
+        return None
+    return provider_fs.FilesystemProvider(roots)
+
+
+#: Static slash commands the REPL recognizes regardless of skill
+#: state. Kept as a module constant so the completer and the
+#: dispatch loop can't drift.
+_STATIC_SLASH_COMMANDS: tuple[str, ...] = ("/quit", "/exit", "/clear", "/help")
+
+
+class _SlashCompleter:
+    """prompt_toolkit completer that fires only on ``/`` prefixes.
+
+    Behavior:
+
+    - Buffer starts with ``/`` (or is exactly ``/``): emit static
+      commands and one entry per skill (``/<name>``), prefix-matched
+      against whatever the user has typed after the slash.
+    - Otherwise: no completions. Free-form chat input should never
+      pop a completion menu, and we don't want completion to fight
+      with the user's typing speed.
+
+    The skill display includes the description as ``meta`` text so
+    the completion menu shows what each skill does without the user
+    having to commit to a guess.
+
+    Implemented as a class rather than reusing ``WordCompleter`` so
+    we can scope completions to the slash-prefix case and inject the
+    per-skill meta text in one place.
+    """
+
+    def __init__(self, skills: list[api_client.SkillSummary]) -> None:
+        # Resolve the full word list once at construction. The skill
+        # list is fetched once at REPL startup (see ``_run_repl``)
+        # so there's no advantage to lazy evaluation here.
+        self._entries: list[tuple[str, str]] = [
+            (cmd, "built-in command") for cmd in _STATIC_SLASH_COMMANDS
+        ]
+        for skill in skills:
+            # Surface the description (truncated) as completion-menu
+            # meta. Long descriptions get clipped so the menu stays
+            # navigable — the full text is in the skill body which
+            # the model loads anyway.
+            meta = skill.description[:60] + ("…" if len(skill.description) > 60 else "")
+            self._entries.append((f"/{skill.name}", meta))
+
+    def get_completions(self, document, complete_event):
+        """Yield prefix-matched ``Completion`` objects.
+
+        Imported lazily so the type isn't pulled at module import
+        time when the REPL isn't run.
+        """
+        from prompt_toolkit.completion import Completion
+
+        text = document.text_before_cursor
+        if not text.startswith("/"):
+            return
+        # ``start_position`` of ``-len(text)`` tells prompt_toolkit to
+        # replace the whole slash-prefix on commit, not just append —
+        # so typing ``/m<Tab>`` and selecting ``/morning-brief``
+        # replaces the buffer rather than producing ``/m/morning-brief``.
+        for word, meta in self._entries:
+            if word.startswith(text):
+                yield Completion(word, start_position=-len(text), display_meta=meta)
+
+    async def get_completions_async(self, document, complete_event):
+        """Async surface required by prompt_toolkit's buffer.
+
+        ``prompt_toolkit.buffer.Buffer.async_completer`` calls
+        ``get_completions_async`` directly via ``async for``. The
+        Completer base class supplies a default that wraps the sync
+        ``get_completions``; duck-typed completers (like this one,
+        kept lightweight to avoid an eager ``prompt_toolkit`` import
+        at module load) must implement the async surface themselves
+        or the buffer raises ``AttributeError`` at first Tab press.
+        """
+        for completion in self.get_completions(document, complete_event):
+            yield completion
+
+
+def _run_repl(
+    creds: credentials.Credentials,
+    *,
+    provider: provider_fs.FilesystemProvider | None = None,
+) -> int:
+    """Interactive chat REPL.
+
+    Reads one line per prompt via prompt_toolkit (history persists in
+    ``history`` beside the credentials file), dispatches each non-empty
+    line to ``chat_send_stream`` so the user sees model thoughts /
+    tool calls as they happen, then prints the final reply via
+    :func:`render.render_reply`.
+
+    Slash commands:
+
+    - ``/quit`` or ``/exit`` — clean exit (rc=0). Ctrl-D does the same.
+    - ``/clear`` — clear the terminal.
+    - ``/help`` — list these commands.
+    - ``/<skill-name>`` — submit ``"Run the <skill-name> skill."`` to
+      the agent, which loads the skill via its contextual mechanism
+      and acts on it. Tab-completion lists all of the calling user's
+      skills (fetched once at REPL startup).
+
+    The REPL is intentionally minimal — Pepper is "one persistent
+    conversation per user" on the server side, so there's no
+    ``/new-thread`` / ``/branch`` / etc. Keeping the command surface
+    small mirrors that.
+    """
+    # Import lazily so tests that don't exercise the REPL aren't
+    # paying for prompt_toolkit's import overhead. Also keeps
+    # ``pepper --help`` snappy.
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.history import FileHistory
+
+    history_path = credentials.credentials_path().parent / "history"
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with (
+        window_title.window_title(_repl_title(creds.server_url)),
+        api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api,
+    ):
+        # Fetch the skill list once at startup. A 401 here means the
+        # token is bad and every subsequent turn would also 401, so
+        # bail loudly. Anything else (network blip, 5xx) degrades to
+        # static-only completion — a REPL with no skill autocomplete
+        # is still useful, a REPL that refuses to open is not.
+        skills: list[api_client.SkillSummary] = []
+        try:
+            skills = api.list_skills()
+        except api_client.ApiError as exc:
+            if exc.status == 401:
+                return _report_api_error(exc)
+            render.info(
+                f"[yellow]warning:[/yellow] couldn't load skills "
+                f"(HTTP {exc.status}); completion will only cover built-in commands."
+            )
+        except httpx.RequestError as exc:
+            render.info(
+                f"[yellow]warning:[/yellow] couldn't load skills ({exc}); "
+                "completion will only cover built-in commands."
+            )
+
+        completer = _SlashCompleter(skills)
+        repl_session: PromptSession = PromptSession(
+            history=FileHistory(str(history_path)),
+            completer=completer,  # ty:ignore[invalid-argument-type]
+            complete_while_typing=False,
+        )
+
+        render.info(
+            f"Pepper REPL — connected to [bold]{creds.server_url}[/bold]. "
+            "Type / + Tab for commands, Ctrl-D to exit. "
+            "Run [bold]pepper --help[/bold] for non-chat subcommands "
+            "(login / whoami / logout)."
+        )
+        skill_names = {s.name for s in skills}
+
+        while True:
+            try:
+                line = repl_session.prompt("pepper> ")
+            except EOFError:
+                # Ctrl-D — clean exit. Print a newline so the next
+                # shell prompt doesn't paste onto the prompt arrow.
+                render.info("")
+                return 0
+            except KeyboardInterrupt:
+                # Ctrl-C inside the prompt cancels the current line,
+                # not the REPL. Loop and re-prompt.
+                continue
+
+            line = line.strip()
+            if not line:
+                continue
+            if line in {"/quit", "/exit"}:
+                return 0
+            if line == "/clear":
+                # Stick with raw ANSI rather than dragging in
+                # ``shutil.get_terminal_size`` or click — the escape
+                # is widely supported and we already require a TTY
+                # for the REPL.
+                sys.stdout.write("\x1b[2J\x1b[H")
+                sys.stdout.flush()
+                continue
+            if line == "/help":
+                render.info(
+                    "Commands:\n  /quit, /exit – leave\n  /clear – clear screen\n"
+                    "  /help – this\n  /<skill> – ask the agent to run a skill "
+                    "(Tab-complete)"
+                )
+                continue
+            if line.startswith("/"):
+                # ``/<skill-name>`` — translate into a hint message
+                # that the agent's skill-loading mechanism picks up.
+                # Keeping the phrasing stable matters: the model uses
+                # it to decide which skill to load.
+                skill_name = line[1:]
+                if skill_name in skill_names:
+                    message = f"Run the {skill_name} skill."
+                    try:
+                        _stream_one_turn(api, message, provider=provider)
+                    except api_client.ApiError as exc:
+                        if exc.status == 401:
+                            _report_api_error(exc)
+                            return 1
+                        _report_api_error(exc)
+                    except httpx.RequestError as exc:
+                        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+                    continue
+                render.error(f"Unknown command: {line}. Type /help for the list.")
+                continue
+
+            try:
+                _stream_one_turn(api, line, provider=provider)
+            except api_client.ApiError as exc:
+                # Don't return — the user can keep chatting after a
+                # one-off API error (e.g. transient 502). 401 is the
+                # exception: a revoked / invalidated token means
+                # every subsequent turn will also fail, so bail out
+                # of the REPL and tell the user to log in again.
+                if exc.status == 401:
+                    _report_api_error(exc)
+                    return 1
+                _report_api_error(exc)
+            except httpx.RequestError as exc:
+                render.error(f"Couldn't reach {creds.server_url}: {exc}")
+
+
+def _stream_one_turn(
+    api: api_client.ApiClient,
+    message: str,
+    *,
+    provider: provider_fs.FilesystemProvider | None = None,
+    trace: bool = True,
+) -> bool:
+    """Drive one streamed turn: dispatch each SSE event to a renderer.
+
+    Pulled into a helper so the REPL loop reads as a flat dispatcher
+    and so tests can drive a single turn without spinning up the
+    whole prompt_toolkit machinery.
+
+    ``provider`` is the local filesystem toolset ``--root`` declared, if
+    any. Its manifest rides on the request; its ``client_tool_call`` frames
+    are served inline, in this loop, **synchronously** — the answer is
+    posted before the next frame is read. That is not a limitation worth
+    engineering around: the server runs one client call at a time (each
+    costs the turn a tool round), and doing the work between two reads of
+    the same stream keeps the whole feature free of threads.
+
+    ``trace`` off suppresses the thought/tool chatter so the one-shot
+    ``pepper chat --root … "…"`` prints exactly what it printed before —
+    the reply. Tool *calls* are still served either way; only the drawing
+    of them changes.
+
+    Return whether the server sent a terminal reply. An error frame or a
+    closed stream without a terminal frame must not count as a successful
+    one-shot command, and neither path resubmits the message.
+    """
+    # Thoughts arrive as fragments of any size followed by a terminal
+    # ``model_thought_block``; the fragments stream onto one line and the block
+    # ends it, so a thought reads as a paragraph on every backend rather than
+    # one word per line on the token-level ones.
+    # What the fragments have put on screen for the thought still open, so the
+    # block can tell whether the screen already holds it. ``retry_attempt``
+    # resets it, so it only holds the attempt a block will close.
+    streamed = ""
+    manifest = provider.manifest() if provider is not None else None
+    for event in api.chat_send_stream(message, client_tools=manifest):
+        if event.kind == "model_thought":
+            text = event.payload.get("text") or ""
+            if text:
+                if trace:
+                    render.render_thought_delta(text, first=not streamed)
+                streamed += text
+        elif event.kind == "model_thought_block":
+            if trace:
+                render.end_thought(event.payload.get("text") or "", streamed=streamed)
+            streamed = ""
+        elif event.kind == "retry_attempt":
+            # The abandoned attempt's fragments stay on screen; end their line
+            # so the retry's start fresh. The common retry lands before
+            # any fragment, and then there is no line to end.
+            if trace and streamed:
+                render.discard_thought()
+            streamed = ""
+        elif event.kind == "tool_call":
+            if trace:
+                render.render_tool_call(event.payload)
+        elif event.kind == "tool_result":
+            if trace:
+                render.render_tool_result(event.payload)
+        elif event.kind == "client_tools":
+            if trace:
+                _render_client_tools_ack(event.payload)
+        elif event.kind == "client_tool_call":
+            _serve_client_tool_call(api, event.payload, provider=provider, trace=trace)
+        elif event.kind == "reply":
+            render.render_reply(event.payload.get("reply") or "")
+            return True
+        elif event.kind == "error":
+            render.error(event.payload.get("message") or "model service unavailable")
+            return False
+        # Unknown kinds skipped silently — forward-compat with future
+        # server-side event types we haven't taught the CLI yet. This is
+        # also what makes the two frames above safe to add: an older CLI
+        # against a newer server simply never runs a client tool.
+    render.error("Chat stream ended without a reply. Check the web chat before sending again.")
+    return False
+
+
+def _render_client_tools_ack(payload: dict) -> None:
+    """Say which declared tools the server refused, and why.
+
+    Silent on the happy path. A dropped tool is worth one line because the
+    alternative is a model that never calls a tool the user thinks they
+    shared, with nothing anywhere saying why.
+    """
+    reason = payload.get("manifest_reason")
+    if reason:
+        render.error(f"The server rejected the whole tool manifest: {reason}.")
+        return
+    for entry in payload.get("rejected") or []:
+        render.info(
+            f"[yellow]note:[/yellow] the server dropped "
+            f"{entry.get('name')!r} ({entry.get('reason')})."
+        )
+
+
+def _serve_client_tool_call(
+    api: api_client.ApiClient,
+    payload: dict,
+    *,
+    provider: provider_fs.FilesystemProvider | None,
+    trace: bool,
+) -> None:
+    """Run one tool locally and post the answer back.
+
+    Answers even when there is no provider: a call for a tool this process
+    never declared still has a ``call_id`` the server is waiting on, and
+    saying so immediately is strictly better than letting it burn the turn's
+    whole twenty-second budget on a question already answered.
+
+    Every failure to *post* is swallowed with a note, deliberately. The
+    result route's 404 means the call is already gone — timed out, or the
+    turn moved on — and there is nothing to recover; raising here would
+    abort a stream whose reply is still coming.
+    """
+    call_id = str(payload.get("call_id") or "")
+    name = str(payload.get("name") or "")
+    if not call_id:
+        return
+    if provider is None:
+        text, is_error = "No local tools are shared with this session.", True
+    else:
+        arguments = payload.get("arguments")
+        text, is_error = provider.call(name, arguments if isinstance(arguments, dict) else {})
+    if trace:
+        render.render_tool_call({"name": name, "args": payload.get("arguments") or {}})
+    try:
+        api.post_tool_result(
+            call_id=call_id,
+            content=[{"type": "text", "text": text}],
+            is_error=is_error,
+        )
+    except (api_client.ApiError, httpx.RequestError) as exc:
+        render.info(f"[yellow]note:[/yellow] couldn't return {name!r} to the server ({exc}).")
+
+
+def cmd_trajectory_show(args: argparse.Namespace) -> int:
+    """``pepper trajectory show <id> [--json]``.
+
+    Default mode prints a header and then one line per event (see
+    :func:`render.render_trajectory` for the exact shape, which is kept
+    stable for tools that parse it). ``--json`` dumps the raw body to
+    stdout for ``jq``-able re-querying.
+
+    Exit codes:
+      0 — success
+      1 — auth failure (revoked / missing token), other API errors
+      2 — invalid trajectory id format
+    """
+    import json
+    import sys
+
+    # Validate the UUID shape locally before splatting it into a URL —
+    # gives a friendlier error than the server's 422.
+    if not re.fullmatch(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        args.trajectory_id,
+    ):
+        render.error(f"trajectory id must be a UUID (got: {args.trajectory_id})")
+        return 2
+
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            if args.json:
+                raw = api.trajectory_get_raw(args.trajectory_id)
+                # Plain stdout — scriptable, pipe to jq.
+                sys.stdout.write(json.dumps(raw, indent=2))
+                sys.stdout.write("\n")
+                return 0
+            detail = api.trajectory_get(args.trajectory_id)
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+
+    render.render_trajectory(detail)
+    return 0
+
+
+def cmd_trajectory_list(args: argparse.Namespace) -> int:
+    """``pepper trajectory list [--limit N] [--offset N]``.
+
+    Renders newest-first. Each row shows seq + channel + created time
+    + a snippet of the first user message — same shape as the web
+    list page, condensed for terminal output.
+    """
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            rows = api.trajectory_list(limit=args.limit, offset=args.offset)
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+
+    render.render_trajectory_list(rows)
+    return 0
+
+
+def _add_calendar_extras(api: Any, payload: dict[str, Any], *, schedule: bool) -> None:
+    """Fold the optional read-only layers into the range payload, in place.
+
+    ``environment`` (weather, daylight), drive ``facts`` on each commute leg in
+    ``days[].travel`` and, for ``schedule``, ``schedule_plan``. Each one is best-effort: a
+    server that lacks it (404) or fails leaves the plain agenda unchanged.
+    """
+
+    def tolerate(call: Any) -> Any:
+        try:
+            return call()
+        except (api_client.ApiError, httpx.RequestError):
+            return None
+
+    dates = [w["date"] for w in payload.get("window") or []]
+    if dates and len(dates) <= 14:
+        payload["environment"] = tolerate(
+            lambda: api.calendar_environment(dates=dates, focus=dates[0])
+        )
+    legs = [leg for day in payload.get("days") or [] for leg in day.get("travel") or []]
+    for leg in legs[:_MAX_COMMUTE_LEGS]:
+        leg["facts"] = tolerate(lambda leg=leg: api.calendar_travel(leg["token"]))
+    if schedule:
+        payload["schedule_plan"] = tolerate(api.calendar_schedule_plan)
+
+
+#: Each leg costs the server a (cached) Maps route lookup, so a month view stays bounded.
+_MAX_COMMUTE_LEGS = 12
+
+
+def cmd_calendar(args: argparse.Namespace) -> int:
+    """``pepper calendar [today|week|schedule] [--start D] [--days N] [--planning] [--json]``."""
+    import datetime
+
+    days = args.days if args.days is not None else (7 if args.window == "week" else 1)
+    if not 1 <= days <= 31:
+        render.error("--days must be between 1 and 31")
+        return 2
+    try:
+        if args.start:
+            datetime.date.fromisoformat(args.start)
+    except ValueError:
+        render.error("--start must be YYYY-MM-DD")
+        return 2
+    if args.planning and (days > 7 or args.window == "schedule"):
+        render.error("--planning covers at most 7 days and replaces the schedule view")
+        return 2
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            # "Today" is the account's date, not the host's: the server reads start in user's zone.
+            start = args.start or next_view.user_now(api).date().isoformat()
+            payload = api.calendar_range(start=start, days=days)
+            planning = api.calendar_planning(start=start, days=days) if args.planning else None
+            _add_calendar_extras(api, payload, schedule=args.window == "schedule")
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    if args.json:
+        _print_json({"range": payload, "planning": planning} if args.planning else payload)
+        return 0
+    mode = "planning" if args.planning else "schedule" if args.window == "schedule" else "calendar"
+    render.render_calendar(payload, mode=mode, cards=planning["cards"] if planning else None)
+    return 0
+
+
+def cmd_next(args: argparse.Namespace) -> int:
+    """``pepper next [--room R] [--first K] [--all] [--json]``."""
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            result = next_view.assemble(api, room=args.room, show_all=args.all, first=args.first)
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    if args.first and result["source"] == "fallback":
+        render.info("Pepper's plans aren't available on this server yet; showing the todos list.")
+    if args.json:
+        _print_json(result)
+    else:
+        render.render_next(result)
+    return 0
+
+
+def cmd_todo_list(args: argparse.Namespace) -> int:
+    """``pepper todos list [--status open|done|dismissed|all] [--room ROOM]``."""
+
+    def run(api: api_client.ApiClient) -> int:
+        rows = api.list_todos(status=args.status, group_id=_opt_group(api, args.room))
+        if args.json:
+            _print_json(rows)
+        else:
+            render.render_todo_list(rows)
+        return 0
+
+    return _with_api(run, _report_api_error)
+
+
+def cmd_todo_add(args: argparse.Namespace) -> int:
+    """``pepper todos add <title...> [--details D] [--due DATE] [--priority P] [--room ROOM]``.
+
+    A room's todo takes only a title and a ``YYYY-MM-DD`` due date. Exit codes: 0 ok ·
+    1 auth/API/transport · 2 bad input (blank title / unparseable ``--due`` / a flag the
+    room form lacks).
+    """
+    title = " ".join(args.title).strip()
+    if not title:
+        render.error("todo title cannot be empty")
+        return 2
+    if args.room and (args.details or args.priority):
+        render.error("--details and --priority aren't available with --room")
+        return 2
+    due_iso: str | None = None
+    due_day: str | None = None
+    if args.due and args.room:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.due):
+            render.error("with --room, --due must be 'YYYY-MM-DD'")
+            return 2
+        due_day = args.due
+    elif args.due:
+        due_iso, err = _parse_due(args.due)
+        if err is not None:
+            render.error(err)
+            return 2
+
+    def run(api: api_client.ApiClient) -> int:
+        todo = api.create_todo(
+            title=title,
+            details=args.details,
+            priority=args.priority,
+            due_date=due_iso,
+            due=due_day,
+            group_id=_opt_group(api, args.room),
+        )
+        render.info(f"Added todo {todo.id}")
+        if not args.room:
+            render.render_todo_list([todo])
+        return 0
+
+    return _with_api(run, _report_api_error)
+
+
+def cmd_todo_done(args: argparse.Namespace) -> int:
+    """``pepper todos done <id> [--room ROOM]``."""
+    return _tick_todo(args, reopen=False)
+
+
+def cmd_todo_reopen(args: argparse.Namespace) -> int:
+    """``pepper todos reopen <id> [--room ROOM]``."""
+    return _tick_todo(args, reopen=True)
+
+
+def _tick_todo(args: argparse.Namespace, *, reopen: bool) -> int:
+    """``done`` / ``reopen``. A tick also releases the rest of the todo's held time, as
+    ticking it on Schedule does. A wrong id or room is the server's one uniform answer;
+    there is no fall-through to other rooms."""
+    if not _valid_uuid(args.todo_id):
+        render.error(f"todo id must be a UUID (got: {args.todo_id})")
+        return 2
+
+    def run(api: api_client.ApiClient) -> int:
+        change = api.reopen_todo if reopen else api.complete_todo
+        change(args.todo_id, group_id=_opt_group(api, args.room))
+        render.info(f"{'Reopened' if reopen else 'Marked done'}: {args.todo_id}")
+        return 0
+
+    return _with_api(run, _report_api_error)
+
+
+def cmd_todo_dismiss(args: argparse.Namespace) -> int:
+    """``pepper todos dismiss <id> [--room ROOM]``."""
+    if not _valid_uuid(args.todo_id):
+        render.error(f"todo id must be a UUID (got: {args.todo_id})")
+        return 2
+
+    def run(api: api_client.ApiClient) -> int:
+        title = api.dismiss_todo(args.todo_id, group_id=_opt_group(api, args.room)).title
+        render.info(f"Dismissed: {title}")
+        return 0
+
+    return _with_api(run, _report_api_error)
+
+
+def _resolve_task_id(
+    api: api_client.ApiClient, task: str, *, group_id: str | None = None
+) -> str | None:
+    """Turn a task name into its id, passing a UUID straight through.
+
+    The API is keyed by id, but a name is the handle every other surface
+    uses — the agent cancels by name, the listing prints names — so making
+    the CLI id-only would be the one place a user has to paste a UUID to
+    do what they can say in a sentence.
+
+    Paused tasks are included in the lookup: ``resume`` is the command
+    most likely to be reached by name, and it only ever targets one.
+    Returns ``None`` (after printing the error) when no task matches.
+
+    With ``group_id`` the name is looked up among that room's tasks — a
+    room's names are its own namespace, so yours never answer for it. A
+    UUID still passes straight through: the server refuses one that is not
+    this room's task.
+    """
+    if _valid_uuid(task):
+        return task
+    if group_id:
+        rows = api.list_scheduled_tasks(include_inactive=True, group_id=group_id)
+    else:
+        rows = api.list_scheduled_tasks(include_inactive=True)
+    for row in rows:
+        if row.name == task:
+            return row.id
+    if group_id:
+        render.error(
+            f"no scheduled task named {task!r} in that room — "
+            "run 'pepper scheduled-tasks list --all --room ROOM'"
+        )
+    else:
+        render.error(f"no scheduled task named {task!r} — run 'pepper scheduled-tasks list --all'")
+    return None
+
+
+def _report_room_task_error(exc: api_client.ApiError) -> int:
+    """A room-task command's errors: 403 is the owner gate, said in one fixed
+    sentence; everything else carries the server's own ``detail`` (no such
+    room, no such task, a taken name, a full budget), which is written to be
+    read."""
+    if exc.status == 403:
+        render.error(_ROOM_TASK_OWNER_ONLY)
+        return 1
+    return _report_api_error(exc)
+
+
+def _destination_dialect_error(
+    to: list[str] | None, *, room: str | None, topic: str | None
+) -> str | None:
+    """Why this ``--to`` / ``--topic`` combination cannot be sent, or ``None``.
+
+    Argparse accepts both dialects; this is where ``--room`` decides which
+    one applies, so a wrong pairing is a usage error (exit 2) rather than a
+    round-trip 422.
+    """
+    chosen = to or []
+    if room:
+        wrong = [d for d in chosen if d not in _ROOM_DESTINATION_CHOICES]
+        if wrong:
+            return (
+                f"--to {wrong[0]} isn't available with --room — a room's task "
+                f"announces to: {', '.join(_ROOM_DESTINATION_CHOICES)}"
+            )
+        if topic is not None and "groups_service" not in chosen:
+            return "--topic picks the topic for --to groups_service; pass that too"
+        return None
+    if topic is not None:
+        return "--topic is only available with --room"
+    wrong = [d for d in chosen if d not in _DESTINATION_CHOICES]
+    if wrong:
+        return f"--to {wrong[0]} is only available with --room"
+    return None
+
+
+def cmd_scheduled_task_list(args: argparse.Namespace) -> int:
+    """``pepper scheduled-tasks list [--all] [--room ROOM]``."""
+    if args.room:
+
+        def run(api: api_client.ApiClient) -> int:
+            group_id = _need_group(api, args.room)
+            rows = api.list_scheduled_tasks(include_inactive=args.all, group_id=group_id)
+            render.render_scheduled_task_list(rows)
+            return 0
+
+        return _with_api(run, _report_room_task_error)
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            rows = api.list_scheduled_tasks(include_inactive=args.all)
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    render.render_scheduled_task_list(rows)
+    return 0
+
+
+def cmd_scheduled_task_show(args: argparse.Namespace) -> int:
+    """``pepper scheduled-tasks show <task>``."""
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            task_id = _resolve_task_id(api, args.task)
+            if task_id is None:
+                return 2
+            detail = api.get_scheduled_task(task_id)
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    render.render_scheduled_task(detail)
+    return 0
+
+
+def cmd_scheduled_task_runs(args: argparse.Namespace) -> int:
+    """``pepper scheduled-tasks runs <task> [--limit N]``."""
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            task_id = _resolve_task_id(api, args.task)
+            if task_id is None:
+                return 2
+            rows = api.list_scheduled_task_runs(task_id, limit=args.limit)
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    render.render_scheduled_task_runs(rows)
+    return 0
+
+
+def cmd_scheduled_task_thread(args: argparse.Namespace) -> int:
+    """``pepper scheduled-tasks thread <task> [--limit N]``.
+
+    Read-only. To reply into the thread, chat normally — the server
+    routes a reply by conversation, not through this command.
+    """
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            task_id = _resolve_task_id(api, args.task)
+            if task_id is None:
+                return 2
+            rows = api.get_scheduled_task_thread(task_id, limit=args.limit)
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    render.render_scheduled_task_thread(rows)
+    return 0
+
+
+def cmd_scheduled_task_add(args: argparse.Namespace) -> int:
+    """``pepper scheduled-tasks add <name> --prompt P (--cron C | --at T) ...``.
+
+    Exit codes: 0 ok · 1 auth/API/transport · 2 bad input (neither or both
+    of --cron/--at, --to alongside --silent, unparseable --at).
+
+    With ``--room`` the task is the room's: recurring only (``--cron``), no
+    ``--description``, and ``--to`` in the room's dialect. A flag the room
+    form lacks is exit 2; a non-owner is refused by the server (exit 1).
+    """
+    dialect_err = _destination_dialect_error(args.to, room=args.room, topic=args.topic)
+    if dialect_err is not None:
+        render.error(dialect_err)
+        return 2
+    if args.room:
+        return _add_room_scheduled_task(args)
+    if (args.cron is None) == (args.at is None):
+        render.error("pass exactly one of --cron (recurring) or --at (one-off)")
+        return 2
+    if args.to and args.silent:
+        render.error("--silent means announce nowhere; it can't be combined with --to")
+        return 2
+    run_at: str | None = None
+    if args.at:
+        run_at, err = _parse_due(args.at, flag="--at")
+        if err is not None:
+            render.error(err)
+            return 2
+    # Three states on the wire, and only one of them is "don't send the
+    # key": omitting inherits the user's notification preference, ``[]``
+    # is the silent task, a list pins those.
+    destinations: list[str] | None = None
+    if args.silent:
+        destinations = []
+    elif args.to:
+        destinations = list(args.to)
+
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            task = api.create_scheduled_task(
+                name=args.name,
+                prompt=args.prompt,
+                cron=args.cron,
+                run_at=run_at,
+                timezone=args.timezone,
+                description=args.description,
+                destinations=destinations,
+            )
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    render.info(f"Scheduled {task.name!r}.")
+    render.render_scheduled_task_list([task])
+    return 0
+
+
+def _add_room_scheduled_task(args: argparse.Namespace) -> int:
+    """``scheduled-tasks add --room``. The dialect is already checked."""
+    if args.at is not None or args.description is not None:
+        render.error("--at and --description aren't available with --room")
+        return 2
+    if args.cron is None:
+        render.error("with --room, pass --cron — a room's task is recurring")
+        return 2
+    if args.to and args.silent:
+        render.error("--silent means announce nowhere; it can't be combined with --to")
+        return 2
+    # Omitted leaves the delivery to the server (what it picks depends on
+    # the deployment); ``[]`` is silent, a list pins those.
+    destinations: list[str] | None = None
+    if args.silent:
+        destinations = []
+    elif args.to:
+        destinations = list(args.to)
+
+    def run(api: api_client.ApiClient) -> int:
+        task = api.create_scheduled_task(
+            name=args.name,
+            prompt=args.prompt,
+            cron=args.cron,
+            timezone=args.timezone,
+            destinations=destinations,
+            group_id=_need_group(api, args.room),
+            topic=args.topic,
+        )
+        render.info(f"Scheduled {task.name!r} on the room.")
+        render.render_scheduled_task_list([task])
+        return 0
+
+    return _with_api(run, _report_room_task_error)
+
+
+def cmd_scheduled_task_edit(args: argparse.Namespace) -> int:
+    """``pepper scheduled-tasks edit <task> [--prompt ...] [--cron ...] ...``.
+
+    Only the flags actually passed are sent, so the server can tell "leave
+    this alone" from "set it to this" — which is why the edits dict is
+    built key by key rather than from a namespace dump.
+    """
+    if args.description is not None and args.clear_description:
+        render.error("pass either --description or --clear-description, not both")
+        return 2
+    edits: dict[str, object] = {}
+    if args.prompt is not None:
+        edits["prompt"] = args.prompt
+    if args.cron is not None:
+        edits["cron"] = args.cron
+    if args.at is not None:
+        run_at, err = _parse_due(args.at, flag="--at")
+        if err is not None:
+            render.error(err)
+            return 2
+        edits["run_at"] = run_at
+    if args.timezone is not None:
+        edits["timezone"] = args.timezone
+    if args.description is not None:
+        edits["description"] = args.description
+    elif args.clear_description:
+        edits["description"] = None
+    if not edits:
+        render.error("nothing to change — pass at least one field to edit")
+        return 2
+
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            task_id = _resolve_task_id(api, args.task)
+            if task_id is None:
+                return 2
+            task = api.update_scheduled_task(task_id, edits=edits)
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    render.info(f"Updated {task.name!r}.")
+    render.render_scheduled_task_list([task])
+    return 0
+
+
+def cmd_scheduled_task_pause(args: argparse.Namespace) -> int:
+    """``pepper scheduled-tasks pause <task> [--room ROOM]`` — soft delete, resumable."""
+    return _flip_scheduled_task(args.task, resume=False, room=args.room)
+
+
+def cmd_scheduled_task_resume(args: argparse.Namespace) -> int:
+    """``pepper scheduled-tasks resume <task> [--room ROOM]``."""
+    return _flip_scheduled_task(args.task, resume=True, room=args.room)
+
+
+def _flip_scheduled_task(task: str, *, resume: bool, room: str | None = None) -> int:
+    """Shared body for ``pause`` / ``resume``.
+
+    A 422 on resume is the server saying the row exists but can't go back
+    on the schedule (a one-off whose moment has passed) — its ``detail``
+    is written for the user, so :func:`_report_api_error` prints it as is.
+
+    With ``room`` the task is looked up among, and flipped on, that room.
+    """
+    if room:
+
+        def run(api: api_client.ApiClient) -> int:
+            group_id = _need_group(api, room)
+            task_id = _resolve_task_id(api, task, group_id=group_id)
+            if task_id is None:
+                return 2
+            flip = api.resume_scheduled_task if resume else api.cancel_scheduled_task
+            row = flip(task_id, group_id=group_id)
+            render.info(f"{'Resumed' if resume else 'Paused'}: {row.name}")
+            render.render_scheduled_task_list([row])
+            return 0
+
+        return _with_api(run, _report_room_task_error)
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            task_id = _resolve_task_id(api, task)
+            if task_id is None:
+                return 2
+            row = (
+                api.resume_scheduled_task(task_id) if resume else api.cancel_scheduled_task(task_id)
+            )
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    render.info(f"{'Resumed' if resume else 'Paused'}: {row.name}")
+    render.render_scheduled_task_list([row])
+    return 0
+
+
+def cmd_scheduled_task_destinations(args: argparse.Namespace) -> int:
+    """``pepper scheduled-tasks destinations <task> (--to D... | --default | --silent)``.
+
+    Exactly one of the three must be given. There is no "unset" default
+    here on purpose: the write replaces the whole set, so a command with
+    no choice on it would have to guess between inherit and silent, which
+    are opposite answers.
+
+    With ``--room`` it is ``--to`` (the room's dialect) or ``--silent`` only:
+    a room has no notification preference of its own for ``--default`` to
+    follow, so the choice has to be said.
+    """
+    if args.room and args.use_default:
+        render.error("--default isn't available with --room — pass --to or --silent")
+        return 2
+    chosen = [bool(args.to), args.use_default, args.silent]
+    if sum(chosen) != 1:
+        render.error("pass exactly one of --to (repeatable), --default, or --silent")
+        return 2
+    dialect_err = _destination_dialect_error(args.to, room=args.room, topic=args.topic)
+    if dialect_err is not None:
+        render.error(dialect_err)
+        return 2
+    destinations: list[str] | None = None if args.use_default else list(args.to or [])
+    if args.room:
+        pinned = list(args.to or [])
+
+        def run(api: api_client.ApiClient) -> int:
+            group_id = _need_group(api, args.room)
+            task_id = _resolve_task_id(api, args.task, group_id=group_id)
+            if task_id is None:
+                return 2
+            task = api.set_scheduled_task_destinations(
+                task_id, destinations=pinned, group_id=group_id, topic=args.topic
+            )
+            render.info(f"Updated delivery for {task.name!r}.")
+            render.render_scheduled_task_list([task])
+            return 0
+
+        return _with_api(run, _report_room_task_error)
+
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            task_id = _resolve_task_id(api, args.task)
+            if task_id is None:
+                return 2
+            task = api.set_scheduled_task_destinations(task_id, destinations=destinations)
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    render.info(f"Updated delivery for {task.name!r}.")
+    render.render_scheduled_task_list([task])
+    return 0
+
+
+def _room_skill_shared_by(row: api_client.RoomSkill) -> str:
+    """Who shared it, as the listing says it."""
+    if row.owner_is_you:
+        return "you"
+    return row.granted_by or "someone no longer here"
+
+
+def _room_skill_state_note(row: api_client.RoomSkill) -> str | None:
+    """Why a room turn cannot run this one, or ``None`` when it can."""
+    if row.state == "inactive":
+        toolsets = ", ".join(row.ungrantable_toolsets) or "one of its toolsets"
+        return f"inactive: a room can't run {toolsets}"
+    if row.state == "shadowed":
+        return f"shadowed: an earlier {row.name!r} shared here wins"
+    if row.state != "active":
+        return row.state
+    return None
+
+
+def _room_skill_line(row: api_client.RoomSkill) -> str:
+    notes = [f"shared by {_room_skill_shared_by(row)}"]
+    state = _room_skill_state_note(row)
+    if state:
+        notes.append(state)
+    marker = "*" if row.can_revoke else " "
+    return f"{marker} {row.name} — {row.description}  [{' · '.join(notes)}]  {row.id}"
+
+
+def _resolve_room_skill(api: api_client.ApiClient, value: str, group_id: str) -> str:
+    """Turn a shared skill's name into its **grant id**, or exit 2.
+
+    The API is keyed by grant id because a name does not pick a row: two
+    members can each share a skill called the same thing into one room. A
+    UUID passes straight through (the server 404s one that is not this
+    room's). One match is the answer; none or several is reported and
+    raises :class:`_BadInputError` — never a guess at which was meant.
+    """
+    if _valid_uuid(value):
+        return value
+    matches = [row for row in api.list_room_skills(group_id) if row.name == value]
+    if len(matches) == 1:
+        return matches[0].id
+    if not matches:
+        render.error(
+            f"no skill named {value!r} is shared with that room — "
+            "run 'pepper skills list --room ROOM'"
+        )
+        raise _BadInputError
+    render.error(
+        f"{len(matches)} skills named {value!r} are shared with that room — "
+        "pass the grant id in place of the name:",
+        soft_wrap=True,
+    )
+    for row in matches:
+        sys.stderr.write(f"  {row.id}  shared by {_room_skill_shared_by(row)} ({row.state})\n")
+    raise _BadInputError
+
+
+def _report_room_skill_share_error(exc: api_client.ApiError) -> int:
+    """``skills share --room``: 409 is the sealed-room refusal, said in one
+    fixed sentence; everything else carries the server's own ``detail`` (no
+    such skill of yours, a toolset a room can't run, the room unavailable),
+    which is written to be read."""
+    if exc.status == 409:
+        render.error(_ROOM_SKILL_SEALED)
+        return 1
+    return _report_api_error(exc)
+
+
+def _report_room_skill_revoke_error(exc: api_client.ApiError) -> int:
+    """``skills revoke --room``: 403 is the who-may-revoke gate, said in one
+    fixed sentence; everything else carries the server's ``detail``."""
+    if exc.status == 403:
+        render.error(_ROOM_SKILL_REVOKE_FORBIDDEN)
+        return 1
+    return _report_api_error(exc)
+
+
+def _refuse_room_for_owned_skill(args: argparse.Namespace, verb: str) -> bool:
+    """True (after saying why) when ``--room`` was passed to a command that
+    only ever acts on the caller's own library."""
+    if getattr(args, "room", None):
+        render.error(_ROOM_OWNS_NO_SKILL.format(verb=verb), soft_wrap=True)
+        return True
+    return False
+
+
+def _cmd_room_skills_list(args: argparse.Namespace) -> int:
+    def run(api: api_client.ApiClient) -> int:
+        rows = api.list_room_skills(_need_group(api, args.room))
+        # Primary output → stdout, plain and grep-able like the own-library
+        # listing; the grant id ends every line because it is what tells two
+        # same-named rows apart.
+        if not rows:
+            sys.stdout.write(
+                "(no skills shared with this room — try `pepper skills share NAME --room ROOM`)\n"
+            )
+            return 0
+        for row in rows:
+            sys.stdout.write(_room_skill_line(row) + "\n")
+        if any(row.can_revoke for row in rows):
+            render.info("* you can revoke it: pepper skills revoke NAME --room ROOM")
+        return 0
+
+    return _with_api(run, _report_api_error)
+
+
+def _cmd_room_skills_show(args: argparse.Namespace) -> int:
+    def run(api: api_client.ApiClient) -> int:
+        group_id = _need_group(api, args.room)
+        detail = api.get_room_skill(group_id, _resolve_room_skill(api, args.name, group_id))
+        note = f"(shared with this room by {_room_skill_shared_by(detail.row)}"
+        state = _room_skill_state_note(detail.row)
+        render.info(f"{note} — {state})" if state else f"{note})")
+        sys.stdout.write(skill_doc.compose_skill_md(_fields_from_detail(detail.skill)))
+        return 0
+
+    return _with_api(run, _report_api_error)
+
+
+def cmd_skills_share(args: argparse.Namespace) -> int:
+    """``pepper skills share NAME --room ROOM`` — share one of YOUR skills.
+
+    Sharing one the room already holds changes nothing and says the same.
+    Exit codes: 0 ok · 1 auth/API/transport, or the room refused · 2 no such room.
+    """
+
+    def run(api: api_client.ApiClient) -> int:
+        row = api.share_room_skill(_need_group(api, args.room), args.name)
+        render.info(f"Shared {row.name!r} with the room.")
+        state = _room_skill_state_note(row)
+        if state:
+            render.info(f"It is {state}.")
+        return 0
+
+    return _with_api(run, _report_room_skill_share_error)
+
+
+def cmd_skills_revoke(args: argparse.Namespace) -> int:
+    """``pepper skills revoke NAME --room ROOM`` — stop sharing it there.
+
+    ``NAME`` is resolved among the room's shared skills; a grant id is taken
+    as is. Removes the room's reference only — the skill stays its owner's.
+    Exit codes: 0 ok · 1 auth/API/transport, or not yours to revoke ·
+    2 no such room, no such shared skill, or an ambiguous name.
+    """
+
+    def run(api: api_client.ApiClient) -> int:
+        group_id = _need_group(api, args.room)
+        api.revoke_room_skill(group_id, _resolve_room_skill(api, args.name, group_id))
+        what = "that skill" if _valid_uuid(args.name) else repr(args.name)
+        render.info(f"Stopped sharing {what} with the room. The skill itself is untouched.")
+        return 0
+
+    return _with_api(run, _report_room_skill_revoke_error)
+
+
+def cmd_skills_list(args: argparse.Namespace) -> int:
+    """``pepper skills list [--room ROOM]`` — yours first, then Pepper's
+    built-ins; with ``--room``, the skills shared with that room."""
+    if getattr(args, "room", None):
+        return _cmd_room_skills_list(args)
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            rows = api.list_skills()
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    yours = [r for r in rows if not r.builtin]
+    builtin = [r for r in rows if r.builtin]
+    # The listing is primary output → stdout (pipeable); render.info is
+    # stderr chrome, reserved for status lines around commands.
+    if yours:
+        sys.stdout.write("Yours:\n")
+        for row in yours:
+            sys.stdout.write(f"  {row.name} — {row.description}\n")
+    else:
+        sys.stdout.write("Yours: (none yet — try `pepper skills new <name>`)\n")
+    if builtin:
+        sys.stdout.write("Built-in (edit creates an override on your account):\n")
+        for row in builtin:
+            sys.stdout.write(f"  {row.name} — {row.description}\n")
+    return 0
+
+
+def cmd_skills_show(args: argparse.Namespace) -> int:
+    """``pepper skills show <name> [--room ROOM]`` — print the skill as SKILL.md.
+
+    With ``--room``, one of the skills shared with that room (a grant id is
+    accepted in place of the name)."""
+    if getattr(args, "room", None):
+        return _cmd_room_skills_show(args)
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            detail = api.get_skill(args.name)
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    if detail.builtin:
+        render.info("(built-in — ``pepper skills edit`` creates an override on your account)")
+    sys.stdout.write(skill_doc.compose_skill_md(_fields_from_detail(detail)))
+    return 0
+
+
+def cmd_skills_new(args: argparse.Namespace) -> int:
+    """``pepper skills new <name>`` — template → $EDITOR → POST.
+
+    Exit codes: 0 ok · 1 auth/API/transport · 2 bad document / aborted / ``--room``.
+    """
+    if _refuse_room_for_owned_skill(args, "write"):
+        return 2
+    template = skill_doc.SkillFields(
+        name=args.name,
+        description="One line: when should Pepper activate this skill?",
+        body=(
+            "Write the playbook here — concrete steps, exact tool names and\n"
+            "arguments, the output format, and the don'ts.\n"
+        ),
+    )
+    fields = _edit_skill_document(skill_doc.compose_skill_md(template))
+    if fields is None:
+        return 2
+    if fields.name != args.name:
+        render.error(
+            f"the document renamed the skill ({args.name!r} → {fields.name!r}) — "
+            "keep the name; it's the identifier you asked to create"
+        )
+        return 2
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            api.create_skill(
+                name=fields.name,
+                description=fields.description,
+                body=fields.body,
+                model=fields.model,
+                toolsets=list(fields.toolsets),
+                max_tool_rounds=fields.max_tool_rounds,
+            )
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    render.info(f"Created skill {fields.name!r}.")
+    return 0
+
+
+def cmd_skills_edit(args: argparse.Namespace) -> int:
+    """``pepper skills edit <name>`` — fetch → $EDITOR → PUT (or POST override).
+
+    Editing a built-in never touches the shared row: after confirmation
+    the edited document is saved as YOUR same-named skill, which shadows
+    the built-in on your account only.
+    """
+    if _refuse_room_for_owned_skill(args, "edit"):
+        return 2
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            detail = api.get_skill(args.name)
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+
+    if detail.builtin:
+        answer = _prompt(
+            f"{args.name!r} is a built-in skill. Editing creates an override on "
+            "your account (the shared version is untouched). Continue? [y/N] "
+        )
+        if answer.lower() not in ("y", "yes"):
+            render.info("Aborted — built-in left as is.")
+            return 0
+
+    fields = _edit_skill_document(skill_doc.compose_skill_md(_fields_from_detail(detail)))
+    if fields is None:
+        return 2
+    if fields.name != detail.name:
+        render.error(
+            f"the document renamed the skill ({detail.name!r} → {fields.name!r}) — "
+            "names are immutable (rename = delete + new)"
+        )
+        return 2
+
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            if detail.builtin:
+                api.create_skill(
+                    name=fields.name,
+                    description=fields.description,
+                    body=fields.body,
+                    model=fields.model,
+                    toolsets=list(fields.toolsets),
+                    max_tool_rounds=fields.max_tool_rounds,
+                )
+                render.info(
+                    f"Created your override of {fields.name!r} — it shadows the "
+                    "built-in on your account."
+                )
+            else:
+                api.update_skill(
+                    name=fields.name,
+                    description=fields.description,
+                    body=fields.body,
+                    model=fields.model,
+                    toolsets=list(fields.toolsets),
+                    max_tool_rounds=fields.max_tool_rounds,
+                )
+                render.info(f"Updated skill {fields.name!r}.")
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    return 0
+
+
+def cmd_skills_delete(args: argparse.Namespace) -> int:
+    """``pepper skills delete <name> [--yes]`` — confirm, then delete YOUR row.
+
+    Confirms before deleting unless ``--yes``.
+    """
+    if _refuse_room_for_owned_skill(args, "delete"):
+        return 2
+    if not args.yes:
+        answer = _prompt(f"Delete your skill {args.name!r}? This cannot be undone. [y/N] ")
+        if answer.lower() not in ("y", "yes"):
+            render.info("Aborted.")
+            return 0
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            api.delete_skill(args.name)
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    render.info(f"Deleted skill {args.name!r}.")
+    return 0
+
+
+def _fields_from_detail(detail: api_client.SkillDetail) -> skill_doc.SkillFields:
+    return skill_doc.SkillFields(
+        name=detail.name,
+        description=detail.description,
+        body=detail.body,
+        model=detail.model,
+        toolsets=detail.toolsets,
+        max_tool_rounds=detail.max_tool_rounds,
+    )
+
+
+def _edit_skill_document(initial: str) -> skill_doc.SkillFields | None:
+    """Open ``initial`` in $EDITOR and parse the result, reprompting on
+    shape errors so a typo doesn't throw the edit away.
+
+    Returns ``None`` when the user aborts (editor failed, no changes on
+    a reprompt decline). Value-level validation is the server's job.
+    """
+    text = initial
+    while True:
+        edited = _open_in_editor(text)
+        if edited is None:
+            # _open_in_editor already reported the specific failure
+            # (bad $EDITOR, launch error, or nonzero exit).
+            render.error("aborting without saving")
+            return None
+        fields, err = skill_doc.parse_skill_md(edited)
+        if fields is not None:
+            return fields
+        render.error(f"couldn't parse the document: {err}")
+        answer = _prompt("Re-open the editor to fix it? [Y/n] ")
+        if answer.lower() in ("n", "no"):
+            return None
+        text = edited
+
+
+def _open_in_editor(initial: str) -> str | None:
+    """Write ``initial`` to a temp .md file, run $VISUAL/$EDITOR (vi
+    fallback), and return the edited text — ``None`` if the editor
+    can't be parsed, can't be launched, or exits nonzero.
+    ``shlex.split`` so values like ``code --wait`` work."""
+    import os
+    import shlex
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    try:
+        command = shlex.split(editor)
+    except ValueError as exc:
+        render.error(f"couldn't parse $VISUAL/$EDITOR ({editor!r}): {exc}")
+        return None
+    if not command:
+        render.error("$VISUAL/$EDITOR is empty — set one to edit skills")
+        return None
+    fd, path = tempfile.mkstemp(suffix=".md", prefix="pepper-skill-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(initial)
+        try:
+            # S603 suppressed: `command` is the user's own $EDITOR, invoked
+            # without a shell — they already control what runs in their terminal.
+            result = subprocess.run([*command, path], check=False)  # noqa: S603
+        except OSError as exc:
+            # FileNotFoundError (no such binary) and friends — a
+            # misconfigured editor should be a friendly message, not a
+            # traceback.
+            render.error(f"couldn't launch editor {editor!r}: {exc}")
+            return None
+        if result.returncode != 0:
+            render.error(f"editor exited with status {result.returncode}")
+            return None
+        return Path(path).read_text(encoding="utf-8")
+    finally:
+        os.unlink(path)
+
+
+def _print_json(obj: object) -> None:
+    """Serialize a dataclass (or a plain list/dict of them) to stdout as JSON.
+
+    ``dataclasses.asdict`` recurses through nested dataclasses (e.g.
+    ``GroupSummary.topics``), which covers every ``--json`` call site here
+    except one shape it doesn't reach on its own: a *top-level* plain
+    ``list`` of dataclass instances (``groups topics --json`` — the
+    endpoint has no wrapping dataclass of its own), so that case is
+    converted element-wise. ``default=str`` is defensive, not load-bearing
+    — every field on these wire shapes is already JSON-safe.
+    """
+    import dataclasses
+    import json
+
+    def _to_plain(value: object) -> object:
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            return dataclasses.asdict(value)
+        return value
+
+    data = [_to_plain(v) for v in obj] if isinstance(obj, list) else _to_plain(obj)
+    sys.stdout.write(json.dumps(data, indent=2, default=str))
+    sys.stdout.write("\n")
+
+
+def _match_by_name[T](
+    value: str, items: Sequence[T], *, name_of: Callable[[T], str]
+) -> tuple[T | None, list[T]]:
+    """Case-insensitive name resolution shared by group/topic lookups.
+
+    An exact (case-insensitive) name match wins outright even if it is also
+    a prefix of other names. Failing that, a *unique* case-insensitive
+    prefix match wins. Returns ``(None, candidates)`` on no match (empty
+    ``candidates``) or an ambiguous one (``len(candidates) > 1``) so the
+    caller can print a "which one?" error without a second pass over
+    ``items``.
+    """
+    lowered = value.lower()
+    exact = [it for it in items if name_of(it).lower() == lowered]
+    if len(exact) == 1:
+        return exact[0], exact
+    if len(exact) > 1:
+        return None, exact
+    prefix = [it for it in items if name_of(it).lower().startswith(lowered)]
+    if len(prefix) == 1:
+        return prefix[0], prefix
+    return None, prefix
+
+
+class _GroupsDisabledError(Exception):
+    """Raised when the groups capability signal says the surface is off.
+
+    Kept distinct from "not found" / "ambiguous" (which return ``None``
+    from the resolvers below and exit 2, a bad-input code) because "not
+    enabled for your account" is an availability fact, not something the
+    user typed wrong — every ``groups`` command handler catches this
+    alongside :class:`api_client.ApiError` and exits 1, the same code
+    ``_report_api_error`` uses for a 401.
+    """
+
+
+def _group_list_or_error(
+    api: api_client.ApiClient, *, archived: bool = False
+) -> api_client.GroupList:
+    """Fetch the groups list, checking the capability signal first.
+
+    ``enabled=False`` means this deployment has no groups service
+    configured — there is no per-user flag, so this is the one place a
+    client can tell (``GroupList``'s docstring calls it out as exactly
+    that: the capability signal for the surface). Every ``groups``
+    subcommand that needs a name→id lookup routes through here so the
+    "not enabled" message is worded the same way everywhere. Raises
+    :class:`_GroupsDisabledError` rather than returning ``None`` — see its
+    docstring for why that exit code has to be distinct.
+    """
+    gl = api.list_groups(archived=archived)
+    if not gl.enabled:
+        raise _GroupsDisabledError
+    return gl
+
+
+def _resolve_group(api: api_client.ApiClient, value: str) -> str | None:
+    """Resolve ``<group>`` to its id.
+
+    A UUID passes straight through untouched — same contract as
+    ``_resolve_task_id``: the server 404s a wrong one, which is cheaper
+    than a client-side existence check nobody asked for. Otherwise matches
+    by name against the caller's unarchived rooms first, falling back to
+    the archived ones so an archived room's name still resolves without
+    ``--archived`` on the enclosing command (only ``groups list``/``topics``
+    have a reason to distinguish the two folds).
+    """
+    if _valid_uuid(value):
+        return value
+    gl = _group_list_or_error(api)
+    match, candidates = _match_by_name(value, gl.groups, name_of=lambda g: g.display_name)
+    if match is None and not candidates:
+        archived = api.list_groups(archived=True)
+        match, candidates = _match_by_name(value, archived.groups, name_of=lambda g: g.display_name)
+    if match is not None:
+        return match.group_id
+    if candidates:
+        listing = ", ".join(f"{g.display_name!r} ({g.group_id})" for g in candidates)
+        render.error(f"{value!r} matches more than one room: {listing}", soft_wrap=True)
+    else:
+        render.error(f"no room named {value!r} — run 'pepper groups list'")
+    return None
+
+
+def _default_topic_id(api: api_client.ApiClient, group_id: str) -> str | None:
+    """The room's default topic, mirroring the web door's own rule
+    (``pepper.features.groups.room``: open a room to its most-recently-active
+    non-archived topic, or ``topics[0]`` if every topic is archived).
+
+    ``list_group_topics`` already answers most-recently-active first
+    (``pepper.features.groups.contract.topics_payload``), so "first
+    non-archived" here is exactly that rule applied client-side — there is
+    no need to read the wire's ``is_default`` instead: that marks the room's
+    *service-side* default topic (where an unprompted post lands), a different
+    question from which topic a person's view opens on.
+    """
+    topics = api.list_group_topics(group_id)
+    if not topics:
+        render.error("this room has no topics")
+        return None
+    default = next((t for t in topics if t.archived_at is None), topics[0])
+    return default.topic_id
+
+
+def _resolve_topic(api: api_client.ApiClient, group_id: str, value: str | None) -> str | None:
+    """Resolve ``<topic>`` to its id, or the room's default when omitted.
+
+    Same name-or-UUID contract as :func:`_resolve_group`, scoped to one
+    room's topics (:meth:`api_client.ApiClient.list_group_topics` — archived
+    included, so a topic name still resolves without ``--archived`` on the
+    caller's own listing).
+    """
+    if value is None:
+        return _default_topic_id(api, group_id)
+    if _valid_uuid(value):
+        return value
+    topics = api.list_group_topics(group_id)
+    match, candidates = _match_by_name(value, topics, name_of=lambda t: t.name)
+    if match is not None:
+        return match.topic_id
+    if candidates:
+        listing = ", ".join(f"{t.name!r} ({t.topic_id})" for t in candidates)
+        render.error(f"{value!r} matches more than one topic: {listing}", soft_wrap=True)
+    else:
+        choices = ", ".join(t.name for t in topics) or "(no topics)"
+        render.error(f"no topic named {value!r} in this room — choices: {choices}")
+    return None
+
+
+class _BadInputError(Exception):
+    """A name that didn't resolve (already reported); the command exits 2."""
+
+
+def _need_group(api: api_client.ApiClient, value: str) -> str:
+    group_id = _resolve_group(api, value)
+    if group_id is None:
+        raise _BadInputError
+    return group_id
+
+
+def _opt_group(api: api_client.ApiClient, value: str | None) -> str | None:
+    return _need_group(api, value) if value else None
+
+
+def _need_topic(api: api_client.ApiClient, group_id: str, value: str | None) -> str:
+    topic_id = _resolve_topic(api, group_id, value)
+    if topic_id is None:
+        raise _BadInputError
+    return topic_id
+
+
+def _report_room_error(exc: api_client.ApiError) -> int:
+    """One line for the statuses room commands meet: 404 is the server's uniform
+    "no such room/topic/message/todo, or you are not a member"; 403 is not allowed."""
+    if exc.status == 404:
+        render.error("not found, or you are not a member of that room")
+        return 2
+    if exc.status == 403:
+        render.error(f"not allowed: {exc.detail or 'the room does not permit this'}")
+        return 1
+    return _report_api_error(exc)
+
+
+def _with_api(
+    run: Callable[[api_client.ApiClient], int],
+    report: Callable[[api_client.ApiError], int] = _report_room_error,
+) -> int:
+    """Load credentials, open a client and map the errors every room command shares."""
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            return run(api)
+    except _BadInputError:
+        return 2
+    except _GroupsDisabledError:
+        render.error("Groups is not enabled for your account.")
+        return 1
+    except api_client.ApiError as exc:
+        return report(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+
+
+def _confirm(prompt: str, *, yes: bool) -> int | None:
+    """Gate a destructive command: ``None`` to go ahead, else the exit code to return.
+
+    ``--yes`` skips it; a terminal gets a y/N question; anything else refuses,
+    since a script must say ``--yes`` out loud."""
+    if yes:
+        return None
+    if not _stdin_is_tty():
+        render.error("this changes the room for everyone; pass --yes to run it without a terminal")
+        return 2
+    if _prompt(f"{prompt} [y/N] ").lower() not in ("y", "yes"):
+        render.info("Aborted.")
+        return 0
+    return None
+
+
+def cmd_groups_list(args: argparse.Namespace) -> int:
+    """``pepper groups list [--archived] [--json]``."""
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            result = _group_list_or_error(api, archived=args.archived)
+    except _GroupsDisabledError:
+        render.error("Groups is not enabled for your account.")
+        return 1
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    if args.json:
+        _print_json(result)
+        return 0
+    render.render_group_list(result)
+    return 0
+
+
+def cmd_groups_show(args: argparse.Namespace) -> int:
+    """``pepper groups show <group>``."""
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            group_id = _resolve_group(api, args.group)
+            if group_id is None:
+                return 2
+            detail = api.get_group(group_id)
+    except _GroupsDisabledError:
+        render.error("Groups is not enabled for your account.")
+        return 1
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    render.render_group_detail(detail)
+    return 0
+
+
+def cmd_groups_topics(args: argparse.Namespace) -> int:
+    """``pepper groups topics <group> [--archived] [--json]``.
+
+    ``list_group_topics`` always answers every topic, archived included
+    (the contract's own fold: "hiding them is the client's fold over one
+    full answer"). Default view here is the folded one; ``--archived``
+    unfolds it.
+    """
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            group_id = _resolve_group(api, args.group)
+            if group_id is None:
+                return 2
+            topics = api.list_group_topics(group_id)
+    except _GroupsDisabledError:
+        render.error("Groups is not enabled for your account.")
+        return 1
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    if not args.archived:
+        # The room's default topic stays even when archived, so ``--json``
+        # always lets a caller identify it (``is_default``); the archived tag
+        # still shows in the text view.
+        topics = [t for t in topics if t.archived_at is None or t.is_default]
+    if args.json:
+        _print_json(topics)
+        return 0
+    render.render_group_topics(topics)
+    return 0
+
+
+def cmd_groups_roster(args: argparse.Namespace) -> int:
+    """``pepper groups roster <group> [--json]``.
+
+    The room's ``@``-mention roster, Pepper first (``GET .../roster``) — the
+    one place a script can learn the person ids ``groups post --mention``
+    takes, since ``groups show`` renders members by name only.
+    """
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            group_id = _resolve_group(api, args.group)
+            if group_id is None:
+                return 2
+            roster = api.group_roster(group_id)
+    except _GroupsDisabledError:
+        render.error("Groups is not enabled for your account.")
+        return 1
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    if args.json:
+        _print_json(roster)
+        return 0
+    render.render_group_roster(roster)
+    return 0
+
+
+def cmd_groups_read(args: argparse.Namespace) -> int:
+    """``pepper groups read <group> [<topic>] [--limit N] [--before C|--since S]
+    [--json] [--mark]``."""
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            group_id = _resolve_group(api, args.group)
+            if group_id is None:
+                return 2
+            topic_id = _resolve_topic(api, group_id, args.topic)
+            if topic_id is None:
+                return 2
+            page = api.list_group_messages(
+                group_id,
+                topic_id,
+                since=args.since,
+                before=args.before,
+                limit=args.limit,
+            )
+            # Mark before printing: a failed mark exits non-zero with nothing on stdout.
+            if args.mark and page.messages:
+                newest = max(m.created_at for m in page.messages)
+                api.set_group_read_mark(group_id, topic_id, read_through=newest)
+            if args.json:
+                _print_json(page)
+            else:
+                render.render_group_messages(page)
+    except _GroupsDisabledError:
+        render.error("Groups is not enabled for your account.")
+        return 1
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    return 0
+
+
+#: First reconnect delay for ``groups watch``, doubling to the cap. Reset by a
+#: frame that shows the stream is healthy (an event, a cursor, a heartbeat), so
+#: a healthy stream that drops once an hour reconnects at once rather than at
+#: the cap. Not by ``: connected`` or an error frame: during a groups outage
+#: every connection is accepted and then answered with a retryable error, and
+#: resetting on either would retry once a second for as long as it lasts.
+_WATCH_BACKOFF_START = 1.0
+_WATCH_BACKOFF_CAP = 30.0
+
+#: Consecutive failed attempts before ``groups watch`` says anything. One
+#: dropped connection that reconnects is routine (a deploy ends every open
+#: stream) and loses nothing, since the cursor resumes the feed, so the first
+#: ``_WATCH_QUIET_FAILURES - 1`` failures of a run are silent. Three tolerates
+#: a drop followed by one more failed attempt (a proxy still switching over)
+#: and starts reporting about three seconds into a real outage (attempts at
+#: 0s, 1s and 3s). A consumer that reads any stderr line as "the feed is
+#: unhealthy" therefore only hears about outages, not deploys.
+_WATCH_QUIET_FAILURES = 3
+
+#: The error slug the server sends when it is shutting down and ends the
+#: stream cleanly. The replacement is already serving, so the first retry in a
+#: run is immediate rather than after the backoff.
+_WATCH_SERVER_RESTARTING = "server_restarting"
+
+#: Statuses where reconnecting cannot help: a revoked or wrong credential, a
+#: token that is not an agent's, a server without the stream. Anything else
+#: non-2xx (5xx, 429, 408) is treated as an outage to wait out.
+_WATCH_FATAL_STATUSES = frozenset({400, 401, 403, 404, 405, 410, 422})
+
+
+def _kind_list(value: str) -> frozenset[str]:
+    """Parse a comma-separated ``--kinds`` / ``--ignore-kinds`` value.
+
+    Any non-empty string is accepted as a kind: the groups service adds kinds
+    over time, and a CLI that only knew today's would refuse tomorrow's. An
+    empty entry (``a,,b``, a trailing comma, an unset shell variable) is a
+    caller bug, so it is an argument error rather than a filter that matches
+    nothing.
+    """
+    kinds = [part.strip() for part in value.split(",")]
+    if not all(kinds):
+        msg = f"expected a comma-separated list of event kinds, got {value!r}"
+        raise argparse.ArgumentTypeError(msg)
+    return frozenset(kinds)
+
+
+def _watch_frame_shows_health(frame: api_client.FeedFrame) -> bool:
+    """Whether ``frame`` proves the stream is past connecting and working."""
+    if frame.kind == "error":
+        return False
+    return not (frame.kind == "comment" and frame.payload.get("comment") == "connected")
+
+
+def _read_cursor_file(path: str) -> int | None:
+    """The cursor stored in ``path``, ``None`` when the file does not exist.
+
+    Raises ``ValueError`` for a file that exists but is not a non-negative
+    integer: silently restarting from 0 would replay the whole feed.
+    """
+    from pathlib import Path
+
+    try:
+        text = Path(path).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    if not text.isdecimal():
+        msg = f"cursor file {path!r} does not hold an integer cursor"
+        raise ValueError(msg)
+    return int(text)
+
+
+def _write_cursor_file(path: str, cursor: int) -> None:
+    """Replace ``path`` with ``cursor`` atomically (write a sibling, fsync,
+    rename), so a crash mid-write leaves the old cursor and never a torn one."""
+    import tempfile
+    from pathlib import Path
+
+    target = Path(path)
+    # mkstemp creates the sibling exclusively with an unpredictable name, so a
+    # planted symlink at the temp path cannot redirect the write.
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(f"{cursor}\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        tmp.replace(target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _watch_event_line(event: dict[str, Any], *, as_json: bool, cursor: int) -> str:
+    """One printed line for one feed event."""
+    if as_json:
+        import json
+
+        return json.dumps({**event, "cursor": cursor}, separators=(",", ":"))
+    parts = [f"#{event.get('id')}", str(event.get("kind"))]
+    if event.get("group_id"):
+        parts.append(f"group={event['group_id']}")
+    if event.get("person_id"):
+        parts.append(f"person={event['person_id']}")
+    payload = event.get("payload")
+    if isinstance(payload, dict):
+        for key in ("topic_id", "message_id"):
+            if payload.get(key):
+                parts.append(f"{key}={payload[key]}")
+    return " ".join(parts)
+
+
+def cmd_groups_watch(args: argparse.Namespace) -> int:
+    """``pepper groups watch [--since CURSOR] [--cursor-file PATH] [--json]
+    [--kinds K,...] [--ignore-kinds K,...]``.
+
+    Follows the agent event stream until interrupted. Each event is printed
+    and flushed *before* the cursor file moves past it, so a crash between the
+    two replays the event instead of losing it (the consumer de-dups by id).
+    A ``cursor`` frame advances the cursor without printing, except under
+    ``--json``, where it is printed so a pipe consumer can persist it too.
+
+    ``--kinds`` / ``--ignore-kinds`` drop events from the *output* only (both
+    modes). A dropped event is still consumed: the cursor, and the cursor
+    file, move past it exactly as for a printed one, so a restart does not
+    replay it. Nothing is printed for it, not even a cursor line, so a
+    consumer woken per line is not woken by it.
+
+    Exit codes: 0 on Ctrl-C, 1 on a refused token (401), a token that is not
+    an agent's (403), a server that has no stream (404), or an ``error`` frame
+    the server marks non-retryable (a suspended agent), 2 on bad arguments.
+    Dropped connections, 5xx and ``retry: true`` error frames reconnect with
+    exponential backoff from the last cursor seen. The first failures of a run
+    are silent (a reconnect loses nothing); the ``Feed unavailable`` notice
+    on stderr starts at the third consecutive failure and ends when the
+    stream next shows a sign of life.
+    """
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    cursor = args.since
+    if cursor is not None and cursor < 0:
+        render.error("--since must be a non-negative cursor.")
+        return 2
+    if cursor is None and args.cursor_file:
+        try:
+            cursor = _read_cursor_file(args.cursor_file)
+        except (ValueError, OSError) as exc:
+            render.error(str(exc))
+            return 2
+    cursor = cursor or 0
+    allowed: frozenset[str] | None = args.kinds
+    ignored: frozenset[str] = args.ignore_kinds or frozenset()
+    reconnecting = False
+    delay = _WATCH_BACKOFF_START
+    failures = 0
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            while True:
+                problem: str | None = None
+                try:
+                    frames = api.watch_agent_events(
+                        since=cursor, last_event_id=cursor if reconnecting else None
+                    )
+                    for frame in frames:
+                        if _watch_frame_shows_health(frame):
+                            delay = _WATCH_BACKOFF_START
+                            failures = 0
+                        if frame.kind == "error":
+                            if frame.payload.get("retry") is False:
+                                render.error(
+                                    "The server closed the stream and will not resume it: "
+                                    f"{frame.payload.get('error', 'error')}."
+                                )
+                                return 1
+                            problem = str(frame.payload.get("error", "error"))
+                            break
+                        if frame.id is not None:
+                            new_cursor = frame.id
+                        elif frame.kind == "cursor" and isinstance(
+                            frame.payload.get("cursor"), int
+                        ):
+                            new_cursor = frame.payload["cursor"]
+                        else:
+                            continue
+                        if frame.kind == "cursor":
+                            if args.json:
+                                _emit_line(_watch_cursor_line(new_cursor))
+                        elif (allowed is None or frame.kind in allowed) and (
+                            frame.kind not in ignored
+                        ):
+                            _emit_line(
+                                _watch_event_line(
+                                    frame.payload, as_json=args.json, cursor=new_cursor
+                                )
+                            )
+                        cursor = max(cursor, new_cursor)
+                        if args.cursor_file:
+                            _write_cursor_file(args.cursor_file, cursor)
+                except api_client.ApiError as exc:
+                    if exc.status in _WATCH_FATAL_STATUSES:
+                        return _report_api_error(exc)
+                    problem = f"HTTP {exc.status}"
+                except httpx.RequestError as exc:
+                    problem = type(exc).__name__
+                pause = delay
+                if problem is not None:
+                    failures += 1
+                    # A server that said it is restarting has a successor up
+                    # already: retry at once, once. A second consecutive
+                    # failure backs off as usual, so a fleet that is all
+                    # restarting is not hammered.
+                    immediate = problem == _WATCH_SERVER_RESTARTING and failures == 1
+                    pause = 0.0 if immediate else delay
+                    if failures >= _WATCH_QUIET_FAILURES:
+                        # stderr only: stdout stays one line per event for the pipe.
+                        render.error(f"Feed unavailable ({problem}); retrying in {pause:g}s.")
+                reconnecting = True
+                if pause:
+                    time.sleep(pause)
+                    delay = min(delay * 2, _WATCH_BACKOFF_CAP)
+    except KeyboardInterrupt:
+        return 0
+    except BrokenPipeError:
+        # The reader went away (``| head -1``): nothing to report, and the
+        # cursor was not advanced past the line that failed to print.
+        # Point stdout at /dev/null so the interpreter's own flush at exit does
+        # not raise a second BrokenPipeError (Python's documented SIGPIPE recipe).
+        with contextlib.suppress(OSError, ValueError):
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        return 0
+    except OSError as exc:
+        render.error(f"Couldn't write the cursor file: {exc}")
+        return 1
+
+
+def _watch_cursor_line(cursor: int) -> str:
+    import json
+
+    return json.dumps({"kind": "cursor", "cursor": cursor}, separators=(",", ":"))
+
+
+def _emit_line(line: str) -> None:
+    """Print one line and flush: a watcher is read through a pipe, and a block-
+    buffered line is an event the consumer sees a minute late."""
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+
+
+def _read_attachment(path: str) -> tuple[bytes, str, str] | None:
+    """Read a local file for ``groups post --attach``.
+
+    Returns ``(content, filename, content_type)``, or ``None`` after
+    printing the error (missing file, permissions) so the caller can bail
+    with exit code 2 before any network call — same shape as the other
+    local-validation-before-any-call checks in this module.
+    """
+    from pathlib import Path
+
+    p = Path(path)
+    try:
+        content = p.read_bytes()
+    except OSError as exc:
+        render.error(f"couldn't read attachment {path!r}: {exc}")
+        return None
+    content_type, _ = mimetypes.guess_type(p.name)
+    return content, p.name, content_type or "application/octet-stream"
+
+
+def cmd_groups_post(args: argparse.Namespace) -> int:
+    """``pepper groups post <group> <topic> [MESSAGE | -] [--attach PATH ...]
+    [--reply-to MESSAGE_ID] [--mention PERSON_ID ...] [--on-behalf-of PERSON_ID]
+    [--idempotency-key KEY] [--json]``.
+
+    ``--json`` prints the created message as one JSON object instead of
+    ``Posted.`` and the bare id: the same fields ``groups read --json`` gives
+    a message, plus ``topic_id``, so an agent gets the id and ``created_at``
+    of its own post without a second read.
+
+    Attachments upload first (``upload_group_attachment``), in the order
+    given, and their ids ride the message create — so a message never posts
+    without the attachments it referenced. A fresh idempotency key is
+    minted per invocation (not per retry): a retried command is a new
+    process, so this alone doesn't prevent a double-post from re-running
+    the command by hand, but it does mean the server's own retry/transport
+    layer can't double it — see ``post_group_message``'s ``Idempotency-Key``.
+    ``--idempotency-key`` replaces the fresh key with the caller's own, for a
+    script that must not double-post when it re-runs the same command after
+    a crash (the agent-member watcher keys it on the message it answers).
+
+    ``--reply-to`` and ``--mention`` pass straight through as the post's
+    ``parent_message_id`` and ``mentions`` (bare person ids, from
+    ``groups roster``). Neither is validated here: the service owns both
+    checks, and a bad id is its 4xx, reported like any other.
+    ``--on-behalf-of`` likewise passes through as ``on_behalf_of_person_id``;
+    the server accepts it only from an agent token.
+
+    Exit codes: 0 ok · 1 auth/API/transport · 2 bad input (empty message,
+    ambiguous/unknown group or topic, unreadable attachment).
+    """
+    # A flag given with an empty value is a caller bug (typically an unset
+    # shell variable), not a request for the default. For --idempotency-key
+    # the default is a fresh key, which would silently drop the caller's
+    # retry safety — so refuse rather than fall through. Checked before the
+    # body, so a bad flag never blocks on reading a '-' stdin body.
+    for flag, value in (
+        ("--idempotency-key", args.idempotency_key),
+        ("--reply-to", args.reply_to),
+        ("--on-behalf-of", args.on_behalf_of),
+        *(("--mention", m) for m in args.mention or []),
+    ):
+        if value is not None and not value.strip():
+            render.error(f"{flag} cannot be empty")
+            return 2
+    # The service accepts a requester only on a reply whose parent the
+    # requester wrote, so a bare --on-behalf-of is a
+    # post it must reject — refuse it here, before any upload.
+    if args.on_behalf_of is not None and args.reply_to is None:
+        render.error("--on-behalf-of needs --reply-to (the requester's message)")
+        return 2
+
+    message_parts = args.message or []
+    text = sys.stdin.read().strip() if message_parts == ["-"] else " ".join(message_parts).strip()
+    if not text:
+        render.error("message body cannot be empty (pass text, or '-' to read it from stdin)")
+        return 2
+
+    # Read every --attach path up front, before any upload starts. Reading
+    # them one at a time interleaved with uploads would let an unreadable
+    # *later* path abort the command after earlier attachments had already
+    # landed in the groups service with nothing ever referencing them —
+    # orphaned uploads the command's own failure gave no sign of.
+    attachments: list[tuple[bytes, str, str]] = []
+    for path in args.attach or []:
+        read = _read_attachment(path)
+        if read is None:
+            return 2
+        attachments.append(read)
+
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            group_id = _resolve_group(api, args.group)
+            if group_id is None:
+                return 2
+            topic_id = _resolve_topic(api, group_id, args.topic)
+            if topic_id is None:
+                return 2
+            attachment_ids: list[str] = []
+            for content, filename, content_type in attachments:
+                uploaded = api.upload_group_attachment(
+                    group_id, filename=filename, content=content, content_type=content_type
+                )
+                attachment_ids.append(uploaded["id"])
+            created = api.post_group_message(
+                group_id,
+                topic_id,
+                message=text,
+                attachment_ids=attachment_ids or None,
+                mentions=args.mention or None,
+                parent_message_id=args.reply_to,
+                idempotency_key=args.idempotency_key or str(uuid.uuid4()),
+                on_behalf_of_person_id=args.on_behalf_of,
+            )
+    except _GroupsDisabledError:
+        render.error("Groups is not enabled for your account.")
+        return 1
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    if args.json:
+        import dataclasses
+
+        message = api_client.group_message_from_dict(created)
+        _print_json({**dataclasses.asdict(message), "topic_id": topic_id})
+        return 0
+    render.info("Posted.")
+    print(created["id"])
+    return 0
+
+
+def _need_person(api: api_client.ApiClient, group_id: str, value: str) -> str:
+    """A member's person id from a name (roster match) or the id itself."""
+    if _valid_uuid(value):
+        return value
+    roster = api.group_roster(group_id)
+    match, found = _match_by_name(value, roster, name_of=lambda m: m.display_name)
+    if match is not None:
+        return match.person_id
+    names = ", ".join(f"{m.display_name!r} ({m.person_id})" for m in found)
+    render.error(f"{value!r} matches {names or 'no member'} — run 'pepper groups roster'")
+    raise _BadInputError
+
+
+def _group_act(
+    args: argparse.Namespace,
+    call: Callable[[api_client.ApiClient, str], object],
+    done: str,
+    *,
+    confirm: str | None = None,
+) -> int:
+    """Resolve ``args.group``, confirm if the act is destructive, run it, say ``done``."""
+    if confirm is not None and (code := _confirm(confirm, yes=args.yes)) is not None:
+        return code
+
+    def run(api: api_client.ApiClient) -> int:
+        call(api, _need_group(api, args.group))
+        render.info(done)
+        return 0
+
+    return _with_api(run)
+
+
+def cmd_groups_edit(args: argparse.Namespace) -> int:
+    """``pepper groups edit <group> <message> TEXT...`` (your own messages only)."""
+    body = " ".join(args.text).strip()
+    return _group_act(
+        args, lambda api, g: api.edit_group_message(g, args.message, body=body), "Edited."
+    )
+
+
+def cmd_groups_delete_message(args: argparse.Namespace) -> int:
+    """``pepper groups delete-message <group> <message> [--yes]``."""
+    return _group_act(
+        args,
+        lambda api, g: api.delete_group_message(g, args.message),
+        "Deleted.",
+        confirm=f"Delete message {args.message} for everyone in the room?",
+    )
+
+
+def cmd_groups_react(args: argparse.Namespace) -> int:
+    """``pepper groups react <group> <message> <emoji>``."""
+    return _group_act(
+        args,
+        lambda api, g: api.react_to_group_message(g, args.message, emoji=args.emoji),
+        "Reacted.",
+    )
+
+
+def cmd_groups_unreact(args: argparse.Namespace) -> int:
+    """``pepper groups unreact <group> <message> <emoji>``."""
+    return _group_act(
+        args, lambda api, g: api.clear_group_reaction(g, args.message, emoji=args.emoji), "Done."
+    )
+
+
+def cmd_groups_download(args: argparse.Namespace) -> int:
+    """``pepper groups download <group> <attachment> --out PATH`` (``-`` for stdout)."""
+    from pathlib import Path
+
+    def save(api: api_client.ApiClient, group_id: str) -> None:
+        content = api.get_group_attachment(group_id, args.attachment)
+        if args.out == "-":
+            sys.stdout.buffer.write(content)
+        else:
+            try:
+                Path(args.out).write_bytes(content)
+            except OSError as exc:
+                render.error(f"couldn't write {args.out!r}: {exc.strerror or exc}")
+                raise _BadInputError from exc
+
+    return _group_act(args, save, f"Saved to {args.out}." if args.out != "-" else "Done.")
+
+
+def cmd_groups_new_topic(args: argparse.Namespace) -> int:
+    """``pepper groups new-topic <group> NAME...``; prints the new topic's id."""
+
+    def run(api: api_client.ApiClient) -> int:
+        topic = api.create_group_topic(_need_group(api, args.group), name=" ".join(args.name))
+        print(topic.get("topic_id") or topic.get("id"))
+        return 0
+
+    return _with_api(run)
+
+
+def cmd_groups_rename_topic(args: argparse.Namespace) -> int:
+    """``pepper groups rename-topic <group> <topic> NAME...``."""
+    name = " ".join(args.name)
+    return _group_act(
+        args,
+        lambda api, g: api.rename_group_topic(g, _need_topic(api, g, args.topic), name=name),
+        f"Renamed to {name!r}.",
+    )
+
+
+def cmd_groups_archive_topic(args: argparse.Namespace) -> int:
+    """``pepper groups archive-topic <group> <topic>``."""
+    return _group_act(
+        args,
+        lambda api, g: api.set_group_topic_archived(
+            g, _need_topic(api, g, args.topic), archived=True
+        ),
+        "Archived.",
+    )
+
+
+def cmd_groups_unarchive_topic(args: argparse.Namespace) -> int:
+    """``pepper groups unarchive-topic <group> <topic>``."""
+    return _group_act(
+        args,
+        lambda api, g: api.set_group_topic_archived(
+            g, _need_topic(api, g, args.topic), archived=False
+        ),
+        "Unarchived.",
+    )
+
+
+def _handle_of(api: api_client.ApiClient, person: str) -> str:
+    """An email or phone as given, else the single Contacts match's handle."""
+    if "@" in person or re.fullmatch(r"\+?[\d\s().-]{7,}", person):
+        return person
+    matches = [c for c in api.search_contacts(person) if c.get("handle")]
+    match, found = _match_by_name(person, matches, name_of=lambda c: c.get("name") or "")
+    if match is None:
+        listing = ", ".join(f"{c.get('name')} <{c['handle']}>" for c in found)
+        render.error(f"{person!r} matches {listing or 'no contact'} — give an email or phone")
+        raise _BadInputError
+    return match["handle"]
+
+
+def cmd_groups_new(args: argparse.Namespace) -> int:
+    """``pepper groups new [--name N] PERSON...``; prints the room's id."""
+
+    def run(api: api_client.ApiClient) -> int:
+        made = api.create_group(people=[_handle_of(api, p) for p in args.people], name=args.name)
+        if not made.get("created", True):
+            render.info("That conversation already existed.")
+        print(made["group_id"])
+        return 0
+
+    return _with_api(run)
+
+
+def cmd_groups_rename(args: argparse.Namespace) -> int:
+    """``pepper groups rename <group> NAME...``."""
+    name = " ".join(args.name)
+    return _group_act(args, lambda api, g: api.rename_group(g, name=name), f"Renamed to {name!r}.")
+
+
+def cmd_groups_archive(args: argparse.Namespace) -> int:
+    """``pepper groups archive <group> [--yes]``; hides the room from your list only."""
+    return _group_act(
+        args,
+        lambda api, g: api.set_group_archived(g, archived=True),
+        "Archived.",
+        confirm=f"Archive {args.group!r}?",
+    )
+
+
+def cmd_groups_unarchive(args: argparse.Namespace) -> int:
+    """``pepper groups unarchive <group>``."""
+    return _group_act(args, lambda api, g: api.set_group_archived(g, archived=False), "Unarchived.")
+
+
+def cmd_groups_leave(args: argparse.Namespace) -> int:
+    """``pepper groups leave <group> [--yes]`` (open rooms only)."""
+    return _group_act(
+        args,
+        lambda api, g: api.leave_group(g),
+        "Left the room.",
+        confirm=f"Leave {args.group!r}? You'll need an invite to come back.",
+    )
+
+
+def cmd_groups_mute(args: argparse.Namespace) -> int:
+    """``pepper groups mute <group>``."""
+    return _group_act(args, lambda api, g: api.set_group_muted(g, muted=True), "Muted.")
+
+
+def cmd_groups_unmute(args: argparse.Namespace) -> int:
+    """``pepper groups unmute <group>``."""
+    return _group_act(args, lambda api, g: api.set_group_muted(g, muted=False), "Unmuted.")
+
+
+def cmd_groups_invite(args: argparse.Namespace) -> int:
+    """``pepper groups invite <group> <handle>`` (open rooms only)."""
+    return _group_act(args, lambda api, g: api.invite_to_group(g, handle=args.handle), "Invited.")
+
+
+def cmd_groups_remove(args: argparse.Namespace) -> int:
+    """``pepper groups remove <group> <person> [--yes]``."""
+    return _group_act(
+        args,
+        lambda api, g: api.remove_group_member(g, _need_person(api, g, args.person)),
+        "Removed.",
+        confirm=f"Remove {args.person!r} from {args.group!r}?",
+    )
+
+
+def cmd_groups_role(args: argparse.Namespace) -> int:
+    """``pepper groups role <group> <person> owner|member [--yes]``."""
+    return _group_act(
+        args,
+        lambda api, g: api.set_group_member_role(
+            g, _need_person(api, g, args.person), role=args.role
+        ),
+        f"Now {args.role}.",
+        confirm=f"Make {args.person!r} {args.role} of {args.group!r}?",
+    )
+
+
+def cmd_groups_apps(args: argparse.Namespace) -> int:
+    """``pepper groups apps <group> [--json]``: the launcher tiles, and what is installable."""
+
+    def run(api: api_client.ApiClient) -> int:
+        gid = _need_group(api, args.group)
+        tiles, unavailable = api.group_app_launcher(gid)
+        if args.json:
+            _print_json(tiles)
+            return 0
+        for t in tiles:
+            print(f"{t.title}  {t.app_key}")
+        if unavailable:
+            render.info("(installed apps unavailable right now)")
+        elif not tiles:
+            print("(no apps installed)")
+        catalog = (api.get_group(gid).get("apps") or {}).get("catalog") or []
+        if catalog:
+            render.info("installable: " + ", ".join(a["app_key"] for a in catalog))
+        return 0
+
+    return _with_api(run)
+
+
+def cmd_groups_install_app(args: argparse.Namespace) -> int:
+    """``pepper groups install-app <group> <app_key>``."""
+    return _group_act(
+        args, lambda api, g: api.install_group_app(g, app_key=args.app_key), "Installed."
+    )
+
+
+def cmd_groups_uninstall_app(args: argparse.Namespace) -> int:
+    """``pepper groups uninstall-app <group> <app> [--yes]`` (``app``: key, title or install id)."""
+
+    def uninstall(api: api_client.ApiClient, group_id: str) -> None:
+        installed = (api.get_group(group_id).get("apps") or {}).get("installed") or []
+        want = args.app.lower()
+        hits = [a for a in installed if want in (a["install_id"], a["app_key"], a["title"].lower())]
+        if len(hits) != 1:
+            render.error(f"{args.app!r} isn't one installed app here — run 'pepper groups apps'")
+            raise _BadInputError
+        api.uninstall_group_app(group_id, hits[0]["install_id"])
+
+    return _group_act(
+        args, uninstall, "Uninstalled.", confirm=f"Uninstall {args.app!r} from {args.group!r}?"
+    )
+
+
+def cmd_groups_sharing(args: argparse.Namespace) -> int:
+    """``pepper groups sharing <group> [--set CALENDAR=LEVEL ...] [--json]``.
+
+    Shows which of your calendars the room sees and at what level. ``--set``
+    changes the named calendars and re-sends the rest as they are, because the
+    server replaces the whole record.
+    """
+
+    def run(api: api_client.ApiClient) -> int:
+        gid = _need_group(api, args.group)
+        info = api.get_group_sharing(gid)
+        cals = info.get("available_calendars") or []
+        levels = info.get("available_levels") or []
+        chosen = dict((info.get("calendar") or {}).get("calendars") or {})
+        for item in args.set or []:
+            name, _, level = item.rpartition("=")
+            exact = [c for c in cals if c["calendar_id"] == name]
+            match = exact[0] if exact else _match_by_name(name, cals, name_of=_cal_name)[0]
+            if match is not None and level == "default":
+                chosen.pop(match["calendar_id"], None)
+                continue
+            if match is None or level not in levels:
+                render.error(
+                    f"can't set {item!r}: levels are default, {', '.join(levels)}; "
+                    f"calendars are {', '.join(_cal_name(c) for c in cals)}"
+                )
+                raise _BadInputError
+            chosen[match["calendar_id"]] = level
+        if args.set:
+            info = api.set_group_sharing(gid, calendars=chosen)
+            chosen = (info.get("calendar") or {}).get("calendars") or {}
+        if args.json:
+            _print_json(info)
+            return 0
+        defaults = info.get("default_levels") or {}
+        for c in cals:
+            level = (
+                chosen.get(c["calendar_id"])
+                or f"{defaults.get(c['calendar_id'], 'none')} (default)"
+            )
+            print(f"{_cal_name(c)}  {level}")
+        return 0
+
+    return _with_api(run)
+
+
+def _cal_name(calendar: dict[str, Any]) -> str:
+    return calendar.get("summary") or calendar["calendar_id"]
+
+
+def cmd_groups_activity(args: argparse.Namespace) -> int:
+    """``pepper groups activity [<group>] [--since TS] [--json]``.
+
+    The feed needs its candidate topics named, so this names the 50 most
+    recently active unarchived topics of the room (or of all your rooms).
+    """
+    from datetime import UTC, datetime, timedelta
+
+    since = args.since or (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+
+    def run(api: api_client.ApiClient) -> int:
+        if args.group:
+            room_ids = [_need_group(api, args.group)]
+        else:
+            room_ids = [r.group_id for r in _group_list_or_error(api).groups]
+        topics = sorted(
+            (t for gid in room_ids for t in api.list_group_topics(gid) if t.archived_at is None),
+            key=lambda t: t.last_activity_at,
+            reverse=True,
+        )
+        rows = api.group_activity(since=since, topic_ids=[t.topic_id for t in topics[:50]])
+        if args.json:
+            _print_json(rows)
+        for r in [] if args.json else rows:
+            render.info(f"{r['group_label']} / {r['topic_label']}  {r['author']}: {r['excerpt']}")
+        return 0
+
+    return _with_api(run)
+
+
+def cmd_groups_search(args: argparse.Namespace) -> int:
+    """``pepper groups search <query> [--json]``: topics by name across your rooms."""
+
+    def run(api: api_client.ApiClient) -> int:
+        rows = api.search_group_topics(args.query)
+        if args.json:
+            _print_json(rows)
+        for r in [] if args.json else rows:
+            print(f"{r['group_name']} / {r['name']}  {r['topic_id']}")
+        return 0
+
+    return _with_api(run)
+
+
+def _report_notes_api_error(exc: api_client.ApiError) -> int:
+    """Map an :class:`ApiError` from a notes/artifacts call to an exit code.
+
+    Two statuses get specific wording
+    distinct from :func:`_report_api_error`'s generic handling:
+
+    - 404 — missing room, missing note, and "not a member" are one answer
+      server-side (``resolve_owner_principal``'s own doc: a prober should
+      learn nothing about which ids exist), so the CLI states that
+      non-distinction rather than guessing which one it was. Exit 2 (bad
+      input): the caller named something that doesn't resolve for them.
+    - 503 — the membership seam itself is unreachable, not a bad argument.
+      Exit 1, with a message inviting a retry rather than a rename.
+
+    Everything else (401 included) falls back to :func:`_report_api_error`.
+    """
+    if exc.status == 404:
+        render.error("no such room or note, or you are not a member")
+        return 2
+    if exc.status == 503:
+        render.error("membership check unavailable, try again")
+        return 1
+    return _report_api_error(exc)
+
+
+def _resolve_note(
+    api: api_client.ApiClient, *, room_principal: str | None, value: str
+) -> str | None:
+    """Resolve ``<note>`` to its id, scoped to ``room_principal`` (``None``
+    for the caller's own notes).
+
+    Same name-or-UUID contract as :func:`_resolve_group`/:func:`_resolve_topic`
+    — a UUID passes straight through untouched (the server 404s a wrong one,
+    routed through :func:`_report_notes_api_error` by the caller). Otherwise
+    resolved in up to two listings, each scoped to ``room_principal`` and
+    restricted to ``_NOTES_KIND``. The route has no offset or cursor, so a
+    lookup gets one page (:data:`_NOTE_RESOLVE_LIMIT`) per listing, and each
+    is narrowed server-side so that page holds only real candidates — never
+    notes whose bodies merely mention the text, as a ``q`` filter would:
+
+    1. ``name=value`` — the whole name, case-insensitively. An exact name
+       wins outright (as in :func:`_match_by_name`), so it resolves however
+       many longer names share its prefix.
+    2. Only when nothing is named exactly ``value``: ``name_prefix=value``,
+       for the unique-prefix promise in ``_NOTE_ARG_HELP``.
+
+    Either page coming back truncated is refused rather than matched: the
+    unseen rows could hold a same-named duplicate or a second prefix match,
+    so any pick inside the page would be a guess. The error points at the
+    id, which always resolves.
+
+    :func:`_match_by_name` already treats more than one case-insensitive
+    exact match as ambiguous rather than picking the first — load-bearing
+    here, since artifact names are deliberately not unique
+    (the server's name lookup documents this): two notes named
+    "Runbook" must not silently resolve to whichever the server listed
+    first.
+    """
+    if _valid_uuid(value):
+        return value
+    result = api.list_artifacts(
+        principal=room_principal, kind=_NOTES_KIND, name=value, limit=_NOTE_RESOLVE_LIMIT
+    )
+    if not result.truncated and not result.items:
+        result = api.list_artifacts(
+            principal=room_principal,
+            kind=_NOTES_KIND,
+            name_prefix=value,
+            limit=_NOTE_RESOLVE_LIMIT,
+        )
+    if result.truncated:
+        render.error(
+            f"too many notes match {value!r} to resolve it by name; "
+            "use the note's id (pepper notes search shows it)",
+            soft_wrap=True,
+        )
+        return None
+    match, candidates = _match_by_name(value, result.items, name_of=lambda n: n.name)
+    if match is not None:
+        return match.id
+    if candidates:
+        listing = ", ".join(f"{n.name!r} ({n.id})" for n in candidates)
+        render.error(f"{value!r} matches more than one note: {listing}", soft_wrap=True)
+    else:
+        where = "in that room" if room_principal else "of yours"
+        render.error(f"no note named {value!r} {where}")
+    return None
+
+
+def cmd_notes_list(args: argparse.Namespace) -> int:
+    """``pepper notes list [--room ROOM] [--label LABEL] [--json]``."""
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            room_principal = _resolve_group(api, args.room) if args.room else None
+            if args.room and room_principal is None:
+                return 2
+            result = api.list_artifacts(
+                principal=room_principal, kind=_NOTES_KIND, label=args.label
+            )
+    except _GroupsDisabledError:
+        render.error("Groups is not enabled for your account.")
+        return 1
+    except api_client.ApiError as exc:
+        return _report_notes_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    if args.json:
+        _print_json(result)
+        return 0
+    render.render_note_list(result)
+    return 0
+
+
+def cmd_notes_search(args: argparse.Namespace) -> int:
+    """``pepper notes search QUERY [--room ROOM] [--label LABEL] [--json]``."""
+    query = " ".join(args.query).strip()
+    if not query:
+        render.error("search text cannot be empty")
+        return 2
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            room_principal = _resolve_group(api, args.room) if args.room else None
+            if args.room and room_principal is None:
+                return 2
+            result = api.list_artifacts(
+                principal=room_principal, kind=_NOTES_KIND, q=query, label=args.label
+            )
+    except _GroupsDisabledError:
+        render.error("Groups is not enabled for your account.")
+        return 1
+    except api_client.ApiError as exc:
+        return _report_notes_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    if args.json:
+        _print_json(result)
+        return 0
+    render.render_note_list(result)
+    return 0
+
+
+def cmd_notes_show(args: argparse.Namespace) -> int:
+    """``pepper notes show <note> [--room ROOM] [--json]``.
+
+    Non-JSON output is the note's raw markdown body on stdout, and nothing
+    else — no name/labels header — so ``show > f.md`` captures exactly the
+    stored body (:func:`render.render_markdown`'s byte-exactness). ``--json``
+    answers the full detail instead: name, labels, ``updated_at``, ``etag``,
+    ``shared``, and the body.
+
+    The detail read itself is viewer-scoped server-side and takes no
+    ``--room``-derived principal (:meth:`api_client.ApiClient.get_artifact_detail`'s
+    own docstring) — ``--room`` here only scopes *name* resolution to that
+    room's notes; a bare UUID resolves the same regardless of ``--room``.
+    """
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            room_principal = _resolve_group(api, args.room) if args.room else None
+            if args.room and room_principal is None:
+                return 2
+            note_id = _resolve_note(api, room_principal=room_principal, value=args.note)
+            if note_id is None:
+                return 2
+            detail = api.get_artifact_detail(note_id)
+            if detail.kind != _NOTES_KIND:
+                # A raw UUID that resolves to a real artifact of some other
+                # kind (an image, a link) is not a note as far as this
+                # surface is concerned — the same "doesn't exist for you"
+                # answer a 404 would give, not a confusing partial read.
+                render.error("no such room or note, or you are not a member")
+                return 2
+    except _GroupsDisabledError:
+        render.error("Groups is not enabled for your account.")
+        return 1
+    except api_client.ApiError as exc:
+        return _report_notes_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    if args.json:
+        _print_json(detail)
+        return 0
+    render.render_markdown(detail.body or "")
+    return 0
+
+
+def _stdin_is_tty() -> bool:
+    """Wraps ``sys.stdin.isatty()`` so the conflict prompt's branch is
+    monkeypatchable directly — pytest's own stdin capture isn't a TTY,
+    same reasoning as ``window_title._stdout_is_tty``."""
+    return sys.stdin.isatty()
+
+
+def _read_file_or_stdin(path: str) -> str | None:
+    """Read a note body from ``path``, or stdin when ``path`` is ``'-'``.
+
+    Mirrors :func:`_read_attachment`'s "read local input before any network
+    call" shape, but returns decoded text — a note body is never binary —
+    and no normalization: ``render.render_markdown``'s byte-exact promise
+    for ``--file``/stdin means whatever is read here is exactly what gets
+    sent. Prints its own error and returns ``None`` on failure — an
+    unreadable path or input that isn't valid UTF-8 (``UnicodeDecodeError``
+    is a ``ValueError``, not an ``OSError``) — so the caller can bail with
+    exit code 2 before touching the API.
+    """
+    from pathlib import Path
+
+    label = "stdin" if path == "-" else repr(path)
+    try:
+        if path == "-":
+            return sys.stdin.read()
+        return Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        render.error(f"couldn't read {label}: {exc}")
+        return None
+
+
+def _texts_match(original: str, edited: str) -> bool:
+    """True when ``edited`` is byte-identical to ``original``, or
+    ``original`` with exactly one trailing newline appended.
+
+    The one tolerance anywhere on the write path, and applied to
+    ``$EDITOR`` output only (``--file``/stdin compare with ``==``) — every
+    other case keeps
+    ``render.render_markdown``'s byte-exact contract. vi/vim conventionally
+    append a trailing newline on save, so a straight ``==`` would treat
+    "opened the editor and changed nothing" as an edit and send a body
+    differing from the stored one by whitespace alone, creating a spurious
+    version row for a no-op ("send nothing if the text is unchanged").
+    """
+    return edited == original or edited == original + "\n"
+
+
+def _note_slug(name: str) -> str:
+    """Filesystem-safe stem for the conflict-save filename: lowercase,
+    every run of non-alphanumerics collapsed to one hyphen, trimmed. Good
+    enough for a scratch file whose exact path the CLI prints back to the
+    user — not a general-purpose slugify utility."""
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return slug or "note"
+
+
+def _save_conflict_copy(name: str, etag: str | None, text: str) -> str | None:
+    """Write ``text`` to ``./<note-slug>.<short-etag>.mine.md``
+    and return the path. ``etag`` is the server's *current* one as of the
+    conflict, not the stale one the CLI sent.
+
+    Never overwrites: two attempts against the same server version (a
+    retry in this run, or a second ``pepper notes edit`` later) can hold
+    different unsaved text, so the file is created exclusively and an
+    existing one bumps a counter (``.mine.1.md``, ``.mine.2.md``, …). If
+    the working directory can't be written at all, the copy goes to the
+    system temp directory instead — likewise if the file opens but the
+    write fails (a full disk). Returns ``None`` (having printed why)
+    only when neither can be written; the caller's diff still shows the
+    user's lines on stderr in that case.
+
+    Created owner-only (``0o600``) whatever the umask, since a note — a
+    room's especially — is private text and the fallback directory is
+    shared with every local user. ``O_EXCL`` refuses an existing path,
+    symlinks included, so a planted link in the temp directory can't
+    redirect the write; ``O_NOFOLLOW`` says so twice where the platform
+    has it.
+    """
+    import itertools
+    import os
+    import tempfile
+    from pathlib import Path
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+
+    stem = f"{_note_slug(name)}.{(etag or 'unknown')[:8]}.mine"
+    last_error: OSError | None = None
+    for directory in (Path(), Path(tempfile.gettempdir())):
+        for n in itertools.count():
+            path = directory / (f"{stem}.md" if n == 0 else f"{stem}.{n}.md")
+            try:
+                fd = os.open(path, flags, 0o600)
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                last_error = exc
+                break
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+            except OSError as exc:
+                # Opened but couldn't be filled (a full disk, say): drop the
+                # partial file this call just created — nothing else can own
+                # it, O_EXCL made it ours — and try the next directory, so
+                # the caller still gets its diff and recovery prompt.
+                last_error = exc
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                break
+            return str(path)
+    render.error(f"couldn't save your text to a file: {last_error}")
+    return None
+
+
+def _print_note_diff(current_body: str, mine: str) -> None:
+    """Unified diff from the server's current body to the user's text,
+    written straight to stderr rather than through
+    :func:`render.error` — a note's body can hold literal ``[``/``]``
+    characters that Rich's markup parser would misread."""
+    import difflib
+
+    diff = difflib.unified_diff(
+        current_body.splitlines(keepends=True),
+        mine.splitlines(keepends=True),
+        fromfile="server (current)",
+        tofile="yours",
+    )
+    sys.stderr.writelines(diff)
+
+
+def cmd_notes_new(args: argparse.Namespace) -> int:
+    """``pepper notes new <name> [--room ROOM] [--file PATH|-]``.
+
+    Body comes from ``$EDITOR`` by default, or from ``--file`` (a path, or
+    ``-`` for stdin) read up front, before any network call — same shape as
+    ``groups post --attach``. ``--room`` is resolved before the editor
+    opens, so a bad room name fails before the user writes anything.
+
+    Exit codes: 0 ok · 1 auth/API/transport/membership-seam-down · 2 bad
+    input (empty body, aborted editor, unreadable ``--file``).
+    """
+    file_body: str | None = None
+    if args.file is not None:
+        file_body = _read_file_or_stdin(args.file)
+        if file_body is None:
+            return 2
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            room_principal = _resolve_group(api, args.room) if args.room else None
+            if args.room and room_principal is None:
+                return 2
+            if file_body is not None:
+                body = file_body
+            else:
+                edited = _open_in_editor("")
+                if edited is None:
+                    return 2
+                body = edited
+            if not body.strip():
+                render.error("note body is empty — aborting")
+                return 2
+            result = api.create_artifact(name=args.name, body=body, principal=room_principal)
+    except _GroupsDisabledError:
+        render.error("Groups is not enabled for your account.")
+        return 1
+    except api_client.ApiError as exc:
+        return _report_notes_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    render.info(f"Created {result.name!r}.")
+    print(result.id)
+    return 0
+
+
+def cmd_notes_edit(args: argparse.Namespace) -> int:
+    """``pepper notes edit <note> [--room ROOM] [--file PATH|-] [--rename NAME]
+    [--if-match ETAG | --force]``.
+
+    Fetches the note's current detail first: it seeds ``$EDITOR`` with the
+    current body (skipped when ``--file``/stdin supplies one directly) and
+    is the "fresh show" the default ``If-Match`` comes from — the same
+    read serves both, so ``--file`` gets a precondition just as current as
+    the editor path's. Sends no ``body`` when the text is unchanged —
+    byte-identical for ``--file``/stdin, or up to one trailing newline for
+    ``$EDITOR`` (:func:`_texts_match`) — and sends nothing at all when no
+    ``--rename`` was given either. An empty result aborts with exit 2,
+    matching the server's own blank-body refusal, before any network call.
+
+    A stale ``If-Match`` raises :class:`api_client.ArtifactConflictError`
+    (412): the user's text is saved to
+    ``./<note-slug>.<short-etag>.mine.md``, a unified diff from the
+    server's current body to that text is printed, and then — on a TTY —
+    the user picks ``[r]e-open`` the editor (seeded with their own text,
+    the new etag becomes the precondition), ``[o]verwrite`` (resend the
+    same text against the new etag), or ``[q]uit``. Off a TTY, or on any
+    other answer, this exits 1 with the saved path already printed. A
+    rename-only edit has no text of the user's to save, diff, or re-open,
+    so its conflict offers only ``[o]verwrite`` (resend the rename alone,
+    never the body) or ``[q]uit``.
+
+    Exit codes: 0 ok · 1 auth/API/transport/membership-seam-down/conflict
+    left unresolved · 2 bad input (no such note, empty body, aborted
+    editor, unreadable ``--file``).
+    """
+    file_body: str | None = None
+    if args.file is not None:
+        file_body = _read_file_or_stdin(args.file)
+        if file_body is None:
+            return 2
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    updated: api_client.ArtifactDetail | None = None
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            room_principal = _resolve_group(api, args.room) if args.room else None
+            if args.room and room_principal is None:
+                return 2
+            note_id = _resolve_note(api, room_principal=room_principal, value=args.note)
+            if note_id is None:
+                return 2
+            current = api.get_artifact_detail(note_id)
+            if current.kind != _NOTES_KIND:
+                render.error("no such room or note, or you are not a member")
+                return 2
+
+            if file_body is not None:
+                new_body = file_body
+            else:
+                edited = _open_in_editor(current.body or "")
+                if edited is None:
+                    return 2
+                new_body = edited
+
+            # The trailing-newline tolerance is for editors that append one
+            # on save; ``--file``/stdin is byte-exact (the ``show > f.md``
+            # round trip), so a one-newline change there is a real change.
+            if file_body is not None:
+                unchanged = new_body == (current.body or "")
+            else:
+                unchanged = _texts_match(current.body or "", new_body)
+            rename = args.rename if args.rename and args.rename != current.name else None
+            if unchanged and rename is None:
+                render.info("Nothing to change.")
+                return 0
+            body_to_send = None if unchanged else new_body
+            if body_to_send is not None and not body_to_send.strip():
+                render.error("note body is empty — aborting")
+                return 2
+            if args.force:
+                if_match: str | None = None
+            elif args.if_match:
+                if_match = args.if_match
+            else:
+                if_match = current.etag
+
+            while True:
+                try:
+                    updated = api.edit_artifact(
+                        note_id,
+                        name=rename,
+                        body=body_to_send,
+                        principal=room_principal,
+                        if_match=if_match,
+                    )
+                except api_client.ArtifactConflictError as exc:
+                    if body_to_send is None:
+                        # Rename only: the user wrote no text, so there is
+                        # nothing to save or diff, and nothing to re-open —
+                        # overwriting resends the rename alone and leaves
+                        # the other writer's body as it is.
+                        render.error("that note has changed since you read it")
+                        if not _stdin_is_tty():
+                            return 1
+                        choice = _prompt("[o]verwrite the name, or [q]uit? ").lower()
+                        if choice in ("o", "overwrite"):
+                            if_match = exc.current_etag
+                            continue
+                        render.info("Aborted.")
+                        return 1
+                    saved_path = _save_conflict_copy(current.name, exc.current_etag, new_body)
+                    _print_note_diff(exc.current_body or "", new_body)
+                    if saved_path is not None:
+                        render.error(
+                            f"that note has changed — your text is saved at {saved_path}",
+                            soft_wrap=True,
+                        )
+                    else:
+                        render.error("that note has changed — your text is in the diff above")
+                    if not _stdin_is_tty():
+                        return 1
+                    choice = _prompt("[r]e-open the editor, [o]verwrite, or [q]uit? ").lower()
+                    if choice in ("o", "overwrite"):
+                        if_match = exc.current_etag
+                        continue
+                    if choice in ("r", "reopen", "re-open"):
+                        reopened = _open_in_editor(new_body)
+                        if reopened is None:
+                            return 2
+                        if not reopened.strip():
+                            render.error("note body is empty — aborting")
+                            return 2
+                        new_body = reopened
+                        body_to_send = new_body
+                        if_match = exc.current_etag
+                        continue
+                    render.info("Aborted.")
+                    return 1
+                else:
+                    break
+    except _GroupsDisabledError:
+        render.error("Groups is not enabled for your account.")
+        return 1
+    except api_client.ApiError as exc:
+        return _report_notes_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    assert updated is not None  # every non-return exit from the loop sets it
+    render.info(f"Updated {updated.name!r}.")
+    return 0
+
+
+def cmd_notes_rm(args: argparse.Namespace) -> int:
+    """``pepper notes rm <note> [--room ROOM] [--yes]``.
+
+    Confirms before deleting unless ``--yes``. The delete itself
+    (``POST /api/v1/apps/notes/actions/delete``) is a soft delete — any
+    room member may delete a room note — recorded with the acting
+    user; there is no ``pepper notes restore`` yet, so this is the
+    only undo there is until the retention window closes.
+
+    Reads the detail first, for the same kind check ``show``/``edit`` make:
+    the delete action itself deletes any artifact kind, so a raw UUID of an
+    image or a link must be refused here, not passed through. The detail
+    read is viewer-scoped, so it can succeed where the owner-scoped delete
+    still refuses — a ``--room`` with the UUID of one of your own notes, or
+    a note deleted between the read and the delete. The action answers
+    those with 422 ("isn't in your collection"), which this maps to the
+    same uniform missing-note answer as a 404; nothing else the CLI sends
+    (a well-formed UUID) can draw a 422.
+
+    Exit codes: 0 ok · 1 auth/API/transport/membership-seam-down · 2 bad
+    input (no such note, or not a note).
+    """
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            room_principal = _resolve_group(api, args.room) if args.room else None
+            if args.room and room_principal is None:
+                return 2
+            note_id = _resolve_note(api, room_principal=room_principal, value=args.note)
+            if note_id is None:
+                return 2
+            detail = api.get_artifact_detail(note_id)
+            if detail.kind != _NOTES_KIND:
+                render.error("no such room or note, or you are not a member")
+                return 2
+            if not args.yes:
+                answer = _prompt(f"Delete {detail.name!r}? This cannot be undone. [y/N] ")
+                if answer.lower() not in ("y", "yes"):
+                    render.info("Aborted.")
+                    return 0
+            try:
+                name = api.delete_artifact(note_id, principal=room_principal)
+            except api_client.ApiError as exc:
+                if exc.status != 422:
+                    raise
+                render.error("no such room or note, or you are not a member")
+                return 2
+    except _GroupsDisabledError:
+        render.error("Groups is not enabled for your account.")
+        return 1
+    except api_client.ApiError as exc:
+        return _report_notes_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    render.info(f"Deleted {name!r}.")
+    return 0
+
+
+def cmd_takeout(args: argparse.Namespace) -> int:
+    """``pepper takeout [--out FILE]``.
+
+    Downloads a zip archive of your Pepper data — conversations,
+    trajectories, memories, artifacts. Carries no credentials: connected
+    accounts are listed in the manifest for reconnecting, not exported.
+    Streams straight to disk so a large archive never sits fully in
+    memory. Open to every account; it only ever exports the token's own
+    user.
+    """
+    creds = _load_or_error()
+    if creds is None:
+        return 1
+    try:
+        with api_client.ApiClient(server_url=creds.server_url, token=creds.token) as api:
+            out_path = api.download_takeout(out_path=args.out)
+    except api_client.ApiError as exc:
+        return _report_api_error(exc)
+    except httpx.RequestError as exc:
+        render.error(f"Couldn't reach {creds.server_url}: {exc}")
+        return 1
+    render.info(f"Wrote takeout archive to {out_path}")
+    return 0
+
+
+def cmd_agent_skill(args: argparse.Namespace) -> int:
+    """``pepper agent-skill [--write DIR [--force]]``.
+
+    Reads packaged data only: no credentials, no network, so it behaves the
+    same under any ``--profile`` and with no login at all. Exit codes: 0 ok ·
+    1 ``--write`` refused or failed (existing file without ``--force``, OS
+    error) · 2 ``--force`` without ``--write``.
+    """
+    if args.write is None:
+        if args.force:
+            render.error("--force only applies with --write DIR")
+            return 2
+        sys.stdout.write(agent_skill.render())
+        return 0
+    from pathlib import Path
+
+    try:
+        target = agent_skill.write_to(Path(args.write), force=args.force)
+    except FileExistsError:
+        render.error(
+            f"{Path(args.write) / 'SKILL.md'} already exists; pass --force to overwrite it."
+        )
+        return 1
+    except OSError as exc:
+        render.error(f"couldn't write {args.write!r}: {exc.strerror or exc}")
+        return 1
+    render.info(f"Wrote {target}.")
+    return 0
+
+
+def cmd_logout(args: argparse.Namespace) -> int:
+    del args
+    path = credentials.credentials_path()
+    if credentials.delete():
+        render.info(f"Removed credentials at {path}.")
+    else:
+        render.info(f"No credentials at {path} — nothing to remove.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+
+
+def _valid_uuid(value: str) -> bool:
+    """True if ``value`` is a canonical UUID string.
+
+    Local pre-check so ``todos done``/``dismiss`` give a friendly error
+    instead of splatting a malformed id into a URL and getting the
+    server's 422.
+    """
+    return bool(
+        re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            value,
+        )
+    )
+
+
+def _parse_due(raw: str, *, flag: str = "--due") -> tuple[str | None, str | None]:
+    """Parse a wall-clock flag value into a timezone-aware ISO-8601 string.
+
+    Accepts ``YYYY-MM-DD`` or ``YYYY-MM-DD HH:MM`` (and anything else
+    :func:`datetime.fromisoformat` understands), interpreted in the
+    machine's **local** timezone — the right zone for a CLI on the
+    user's own machine, and what they mean when they type a time. The
+    server stores it as UTC.
+
+    ``flag`` only names the option in the error message. Shared by
+    ``todos add --due`` and ``scheduled-tasks add/edit --at``: both take a
+    local wall-clock time and both must send an *aware* value, since the
+    server has no way to guess the client's zone.
+
+    Returns ``(iso, None)`` on success or ``(None, error_message)`` so
+    the caller can print + exit 2 without raising.
+    """
+    import datetime as _dt
+
+    try:
+        parsed = _dt.datetime.fromisoformat(raw)
+    except ValueError:
+        return None, f"couldn't parse {flag} {raw!r} (try 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM')"
+    # Naive input → interpret in local zone (astimezone on a naive dt
+    # assumes local), giving an aware datetime the server can store.
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return parsed.isoformat(), None
+
+
+def _load_or_error() -> credentials.Credentials | None:
+    """Load credentials or print the error and return ``None``.
+
+    Pulled out so every command shares the "not logged in" message
+    shape — keeps the affordance consistent across ``whoami`` /
+    ``chat`` / future commands.
+    """
+    try:
+        return credentials.load()
+    except credentials.CredentialsError as exc:
+        render.error(str(exc))
+        return None
+
+
+def _report_api_error(exc: api_client.ApiError) -> int:
+    """Map an :class:`ApiError` to a CLI exit code + error message.
+
+    401 gets the bespoke "log in again" hint because that's the
+    overwhelmingly likely cause (revoked token, server-side reset,
+    typo on login). Other statuses get the server's ``detail`` if
+    it provided one, else the bare HTTP status.
+    """
+    if exc.status == 401:
+        render.error("Authentication failed (401). Run 'pepper login' to refresh your token.")
+        return 1
+    if exc.detail:
+        render.error(f"Server returned {exc.status}: {exc.detail}")
+    else:
+        render.error(f"Server returned {exc.status}.")
+    return 1
+
+
+def _prompt(prompt: str) -> str:
+    """``input``-with-prompt that returns an empty string on EOF.
+
+    EOF is reasonable for the server URL prompt (user accepts the
+    default by hitting Ctrl-D); the token prompt has its own EOF
+    handling because we want a clear "no token" error there.
+    """
+    try:
+        return input(prompt).strip()
+    except EOFError:
+        return ""
+
+
+def _prompt_secret(prompt: str) -> str:
+    """``getpass`` with EOF coerced to empty. Like :func:`_prompt`
+    but no echo — paste-in tokens don't show on screen, so a stray
+    ``screen`` recording of the login doesn't leak the credential."""
+    try:
+        return getpass.getpass(prompt).strip()
+    except EOFError:
+        return ""
+
+
+if __name__ == "__main__":
+    sys.exit(main())

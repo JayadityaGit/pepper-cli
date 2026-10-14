@@ -1,0 +1,170 @@
+[project]
+name = "vycari-pepper"
+version = "0.0.1"
+description = "Command-line client for Pepper — bearer-token API access to /api/v1/."
+requires-python = ">=3.13"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Allen Hutchison" }]
+# Deliberately narrow. The CLI is also the de-facto API contract that
+# future native clients will port from, so anything that creeps in
+# here either needs a portable analog or has to leave.
+dependencies = [
+    "httpx>=0.27",
+    "rich>=13.0",
+    "prompt_toolkit>=3.0.53",
+    "pyyaml>=6.0",
+    # IANA zone data for ``zoneinfo`` on Windows, which ships none: "today" is
+    # the account's date (``next_view.user_now``), and without it every
+    # non-UTC account silently falls back to UTC. Pure data, no build step.
+    "tzdata; sys_platform == 'win32'",
+    # Cosmetic (names the process ``pepper``; see ``proctitle.py``), and a
+    # C extension — so only where setproctitle 1.3.7 ships a wheel for
+    # CPython 3.13/3.14: macOS (universal2 + arm64) and Linux
+    # x86_64/aarch64/ppc64le (glibc + musl). Anywhere else a mandatory
+    # dependency would fall back to an sdist build that fails without a
+    # compiler and blocks install; the lazy import in ``proctitle`` just
+    # skips the rename instead. Widen the Python bound once a release ships
+    # 3.15 wheels.
+    "setproctitle>=1.3.7; platform_python_implementation == 'CPython' and python_version < '3.15' and (sys_platform == 'darwin' or (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64' or platform_machine == 'ppc64le')))",
+]
+
+[project.scripts]
+# ``uv sync`` puts ``pepper`` on PATH in the project venv. The
+# distribution is named ``vycari-pepper`` (the name ``pepper-cli`` is taken
+# on PyPI); the console script stays ``pepper`` and the import package
+# stays ``pepper_cli``.
+pepper = "pepper_cli.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-httpx>=0.30",
+    # Upper bound deliberate. ruff is pre-1.0 and a minor bump can enable
+    # rules outside the configured ``select`` — 0.16.0 did exactly that,
+    # turning CI red the moment it resolved, with no commit to blame. Same
+    # rationale as the ``ty`` pin below. Raise the bound intentionally and
+    # fix the new findings in that PR.
+    "ruff>=0.16.10,<0.17",
+    "ty>=0.0.85,<0.1",
+    "pytest-cov>=5.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pepper_cli"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+asyncio_default_test_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["src/pepper_cli"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+# Lint posture: select *everything* ruff ships, then subtract. `ALL` opts in
+# to every rule including future ones, so ruff upgrades are the moment new
+# findings appear — the version is pinned in `uv.lock` and bumped
+# deliberately, and `ruff check --statistics` after a bump tells you what a new
+# release added. Each ignore below is a decision, not a backlog: if a rule is
+# merely inconvenient rather than wrong for this codebase, fix the code instead.
+[tool.ruff.lint]
+select = ["ALL"]
+
+ignore = [
+    # --- Conflicts with `ruff format` (the formatter owns these) ---------
+    "W191", "E111", "E114", "E117", "D206", "D300",
+    "Q000", "Q001", "Q002", "Q003",
+    "COM812", "COM819", "ISC001", "ISC002",
+
+    # --- Docstrings: we document modules and non-obvious functions, not
+    # every public symbol, and we don't enforce prose shape. -------------
+    "D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107",
+    "D203", "D213",              # each conflicts with a sibling rule we keep
+    "D205", "D400", "D401", "D415",
+    "D209",                      # house style closes `"""` on the last text line
+
+    # --- Typography: prompts, docstrings and comments intentionally use
+    # en/em dashes and curly quotes; these rules flag them as ambiguous. -
+    "RUF001", "RUF002", "RUF003",
+
+    # --- Annotations: `ty` is the type gate (see the ty note below). ANN
+    # would demand annotating every test function for no checker benefit. -
+    "ANN",
+
+    # --- Typing-only imports: hoisting imports into `TYPE_CHECKING` blocks
+    # is churn here, and annotations are resolved at runtime in places. ---
+    "TC001", "TC002", "TC003",
+
+    # --- Deliberate house style ------------------------------------------
+    "CPY001",                    # no copyright headers (the LICENSE and NOTICE files carry it)
+    "TRY003", "EM101", "EM102",  # long messages at the `raise` site read better
+    "PLC0415",                   # local imports break import cycles / defer cost
+    "BLE001",                    # broad `except` is the documented fail-open shape
+    "FIX002", "TD002", "TD003",  # TODO comments don't need an owner or issue link
+    "ERA001",                    # misfires on prose and commented-out config
+
+    # --- Complexity metrics: judgement calls, not defects ----------------
+    "C901", "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR0917",
+
+    # --- Heuristics that misfire more than they land ---------------------
+    "S101",                      # assert is our internal-invariant idiom
+    "S105", "S106", "S107",      # matches on names like TOKEN_URI, not secrets
+    "PLR2004",                   # HTTP codes and small ints read fine inline
+    "ARG001", "ARG002", "ARG005",  # callback/protocol signatures must match
+    "FBT001", "FBT002", "FBT003",  # boolean args here are established API
+    "PTH",                       # os.path is fine; migrating is churn
+    "N802", "N801", "N813", "N814",  # names mirror external/wire casing
+    "N818",                      # renaming exception classes breaks callers
+    "PERF401", "PERF403",        # explicit loops are often the clearer form
+    "PLW2901",                   # rebinding a loop var while normalising is idiomatic
+    "TRY300", "TRY301",          # `else`-after-`try` is a style preference
+    "A002",                      # shadowing `id`/`type` in a narrow scope is fine
+    # `lambda: Thing()` is not interchangeable with `Thing` anywhere the
+    # consumer introspects the callable's signature, so its autofix can
+    # silently change behaviour.
+    "PLW0108",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# `cli.py` is the one module that calls bare `print`: plain, unstyled lines
+# meant for pipes (a created id, `whoami` fields) and argv errors on stderr.
+# Everything else writes through the rich consoles in `render.py`, which this
+# rule does not flag, so a `print` anywhere else still fails lint.
+"src/pepper_cli/cli.py" = ["T201"]
+# Tests assert, reach into internals, and use literal fixtures on purpose.
+# Entries here are only those NOT already in the global `ignore` above, so
+# every line is load-bearing.
+"tests/**" = [
+    "SLF001",    # tests inspect private state
+    "INP001",
+    # pytest idioms: composite asserts, broad `raises`, and multi-statement
+    # `raises` blocks are all normal test shapes, not defects.
+    "PT006", "PT011", "PT012", "PT017", "PT018", "PT019",
+    "S104", "S603", "S607",  # tests exercise bind addresses and subprocesses
+    "ASYNC230", "ASYNC240",  # fixture/IO helpers, never on a request path
+    "PLW0603", "PLW1510",
+    "RUF012",    # stub classes collect calls in a plain list attribute
+]
+
+# Static type checking — a lenient baseline. Existing findings are suppressed
+# inline with `# ty: ignore[...]`; new type errors fail CI. Regenerate with
+# `uv run --no-sync ty check --add-ignore src/pepper_cli/`.
+[tool.ty.environment]
+python-version = "3.13"

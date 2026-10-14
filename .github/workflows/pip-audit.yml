@@ -1,0 +1,70 @@
+name: pip-audit
+
+# Scans the resolved dependency set (from uv.lock, via `uv export`) against the PyPI Advisory
+# Database / OSV for known-vulnerable versions. Dependabot (.github/dependabot.yml) handles
+# routine version bumps and `uv sync --frozen` enforces the hash-pinned lockfile, but neither
+# one warns when a pinned version turns out to have a published CVE — this closes that gap.
+#
+# Posture: WARN-FIRST (same as zizmor.yml). The audit step is non-blocking (continue-on-error)
+# so a finding shows up in the run logs without failing the PR. Promoting this to a required
+# gate is a one-line change — drop `continue-on-error` — once the baseline has held.
+#
+# CRITICAL, do not remove: this workflow is path-filtered (`paths:` below) and MUST NEVER be
+# added to branch protection's required-checks list while it stays path-filtered and has no
+# `merge_group` trigger. A required workflow that doesn't run on every event leaves every
+# merge-queue entry pending forever. Promoting this later means adding a bare `merge_group:`
+# trigger alongside the filtered `pull_request:` one — not just deleting `continue-on-error`.
+
+on:
+  pull_request:
+    paths:
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/pip-audit.yml"
+  schedule:
+    # Weekly, Wednesday 03:00 UTC — off-peak.
+    - cron: "0 3 * * 3"
+  workflow_dispatch:
+
+concurrency:
+  group: pip-audit-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only: the scan never needs to write.
+permissions:
+  contents: read
+
+jobs:
+  pip-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          python-version: "3.13"
+
+      # Resolve the locked dependency set to a plain requirements list. --no-emit-project
+      # excludes this package itself (not yet on PyPI, so it has no advisories); --no-dev keeps
+      # this the runtime attack surface, not lint/test tooling.
+      - name: Export locked dependencies
+        run: uv export --format requirements-txt --no-emit-project --no-dev -o requirements-audit.txt
+
+      # Pinned to an exact version so the baseline is reproducible; bump deliberately (a newer
+      # pip-audit may surface new advisories or change flags). --disable-pip skips pip-audit's
+      # own environment resolution since we're auditing the exported lockfile directly, not the
+      # current interpreter's site-packages. --strict fails (nonzero exit) if any dependency
+      # can't be resolved against the advisory DB, not just on a found vulnerability.
+      # Installed as its own step WITHOUT continue-on-error: an index/network failure fetching
+      # the tool is an infra failure that must fail the job — folding install into the tolerated
+      # step below would let the job go green having never audited anything.
+      - name: Install pip-audit
+        run: uvx pip-audit==2.10.1 --version
+
+      - name: Run pip-audit
+        continue-on-error: true # warn-first — see header comment; only the audit outcome is tolerated
+        run: uvx pip-audit==2.10.1 -r requirements-audit.txt --strict --disable-pip
