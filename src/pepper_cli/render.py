@@ -857,10 +857,10 @@ def _format_stamp(iso: str) -> str:
     Falls back to the raw string when it can't be parsed: better a
     verbatim timestamp than a crashed listing.
     """
-    import datetime as _dt
+    import datetime as dt
 
     try:
-        parsed = _dt.datetime.fromisoformat(iso).astimezone()
+        parsed = dt.datetime.fromisoformat(iso).astimezone()
     except ValueError:
         return iso
     rendered = parsed.strftime("%Y-%m-%d %H:%M")
@@ -883,10 +883,10 @@ def _format_due(iso: str, date_only: bool | None = None) -> str:
     otherwise. Falls back to the raw string if it can't be parsed —
     better a verbatim timestamp than a crashed listing.
     """
-    import datetime as _dt
+    import datetime as dt
 
     try:
-        parsed_utc = _dt.datetime.fromisoformat(iso)
+        parsed_utc = dt.datetime.fromisoformat(iso)
     except ValueError:
         return iso
     if date_only:
