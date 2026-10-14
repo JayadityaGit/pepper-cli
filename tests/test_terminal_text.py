@@ -23,7 +23,7 @@ from rich.console import Console
 
 from pepper_cli import api_client, cli, credentials, render
 from pepper_cli.secret import SecretStr
-from pepper_cli.terminal_text import sanitize_line, sanitize_text
+from pepper_cli.terminal_text import make_visible, sanitize_line, sanitize_text
 
 MARKUP = "[red]x[/red] [link=https://evil.example]y[/link]"
 HOSTILE = (
@@ -607,3 +607,29 @@ def test_watch_json_line_is_left_as_the_server_sent_it() -> None:
     event = {"id": 1, "kind": H}
     line = cli._watch_event_line(event, as_json=True, cursor=1)
     assert json.loads(line) == {**event, "cursor": 1}
+
+
+# ---------------------------------------------------------------------------
+# the note-conflict diff: differences must stay visible, controls must not run
+
+
+def test_make_visible_spells_out_controls_and_keeps_newlines_and_tabs() -> None:
+    assert make_visible("a\tb\nc\x1b[2Jd\re\u202ef") == "a\tb\nc\\x1b[2Jd\\re\\u202ef"
+    assert make_visible("plain [red]x[/red] caf\u00e9") == "plain [red]x[/red] caf\u00e9"
+
+
+def test_note_diff_shows_a_change_that_is_only_an_escape_sequence(capsys) -> None:
+    cli._print_note_diff("hello\nworld\n", "hello\x1b[2J\nworld\r\n")
+    err = capsys.readouterr().err
+    assert not _FORBIDDEN.search(err), repr(err)
+    assert "\r" not in err
+    assert "-hello\n" in err
+    assert "+hello\\x1b[2J\n" in err
+    assert "+world\\r\n" in err
+
+
+def test_note_diff_of_hostile_bodies_prints_no_controls(capsys) -> None:
+    cli._print_note_diff(HOSTILE, HOSTILE + "\nmore")
+    err = capsys.readouterr().err
+    assert not _FORBIDDEN.search(err), repr(err)
+    assert not _ALSO_FORBIDDEN_C0.search(err), repr(err)

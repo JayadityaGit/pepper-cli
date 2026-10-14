@@ -80,3 +80,20 @@ def sanitize_text(text: str) -> str:
     """
     text = strip_sequences(text)
     return _TEXT_CONTROL_CHAR_RE.sub("", text.replace("\r\n", "\n").replace("\r", "\n"))
+
+
+# Everything :func:`make_visible` spells out: every control character except
+# newline and tab (ESC included), and the invisible format characters.
+_INVISIBLE_RE = re.compile(_TEXT_CONTROL_CHAR_RE.pattern + "|" + INVISIBLE_FORMAT_RE.pattern)
+
+
+def make_visible(text: str) -> str:
+    r"""``text`` with every control and invisible character spelled out.
+
+    Where :func:`sanitize_text` drops what it cannot print, this replaces
+    each such character with its Python escape (``\x1b``, ``\r``,
+    ``\u202e``), so text that differs *only* in those characters still
+    looks different. Newlines and tabs are kept. Used where the difference
+    itself is the point, such as a diff shown before an overwrite.
+    """
+    return _INVISIBLE_RE.sub(lambda m: repr(m.group())[1:-1], text)

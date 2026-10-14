@@ -98,7 +98,7 @@ from pepper_cli import (
 )
 from pepper_cli.provider import fs as provider_fs
 from pepper_cli.secret import SecretStr
-from pepper_cli.terminal_text import sanitize_line, sanitize_text
+from pepper_cli.terminal_text import make_visible, sanitize_line
 
 #: Default server URL used by ``pepper login`` when ``--server`` is
 #: not provided and the user accepts the prompt default. Production
@@ -4499,20 +4499,25 @@ def _save_conflict_copy(name: str, etag: str | None, text: str) -> str | None:
 
 
 def _print_note_diff(current_body: str, mine: str) -> None:
-    """Unified diff from the server's current body to the user's text,
+    r"""Unified diff from the server's current body to the user's text,
     written straight to stderr rather than through
     :func:`render.error` — a note's body can hold literal ``[``/``]``
-    characters that Rich's markup parser would misread. Both sides are
-    cleaned of terminal controls for display; the diff is only shown."""
-    import difflib
+    characters that Rich's markup parser would misread.
+
+    The diff is taken over the raw bodies, so a change that is only an
+    escape sequence or a carriage return still shows up before the user
+    decides whether to overwrite; each diff line is then printed with its
+    control and invisible characters spelled out (``\x1b``) rather than
+    sent to the terminal live. Lines are split on ``\n`` alone so a stray
+    control character cannot itself end a line."""
+
+    def lines(text: str) -> list[str]:
+        return re.findall(r"[^\n]*\n|[^\n]+$", text)
 
     diff = difflib.unified_diff(
-        sanitize_text(current_body).splitlines(keepends=True),
-        sanitize_text(mine).splitlines(keepends=True),
-        fromfile="server (current)",
-        tofile="yours",
+        lines(current_body), lines(mine), fromfile="server (current)", tofile="yours"
     )
-    sys.stderr.writelines(diff)
+    sys.stderr.writelines(make_visible(line) for line in diff)
 
 
 def cmd_notes_new(args: argparse.Namespace) -> int:
