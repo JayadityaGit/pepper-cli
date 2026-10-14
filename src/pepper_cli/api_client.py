@@ -26,10 +26,11 @@ import os
 import re as _re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Any, Self
+from typing import Any, NoReturn, Self
 
 import httpx
 
+from pepper_cli._version import USER_AGENT
 from pepper_cli.secret import SecretStr
 
 #: Ordinary API request timeout (seconds). Chat streams may have long gaps
@@ -68,6 +69,20 @@ class ApiError(Exception):
         if detail:
             msg += f": {detail}"
         super().__init__(msg)
+
+
+class UpgradeRequiredError(Exception):
+    """A 426 from the server: this client version is no longer supported.
+
+    Deliberately *not* an :class:`ApiError`: the many ``except ApiError``
+    handlers in the CLI each map an error to one command's message, and none
+    of them should swallow this. It propagates to :func:`pepper_cli.cli.main`,
+    which prints ``message`` to stderr and exits non-zero. Never retried.
+    """
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+        super().__init__(message)
 
 
 class ArtifactConflictError(ApiError):
@@ -599,9 +614,10 @@ def device_start(
         resp = http.post(
             f"{server_url}/auth/device/start",
             json={"client": "cli", "device_name": device_name},
+            headers={"User-Agent": USER_AGENT},
         )
         if resp.status_code >= 400:
-            raise ApiError(status=resp.status_code, body=resp.text, detail=_extract_detail(resp))
+            _raise_for_error(resp)
         body = resp.json()
         return DeviceStart(
             device_code=SecretStr(body["device_code"]),
@@ -636,6 +652,7 @@ def device_poll(
         resp = http.post(
             f"{server_url}/auth/device/poll",
             json={"device_code": device_code.get_secret_value()},
+            headers={"User-Agent": USER_AGENT},
         )
         if resp.status_code == 429:
             interval: int | None = None
@@ -647,7 +664,7 @@ def device_poll(
                 interval = slow_body.get("interval")
             return DevicePoll(status="slow_down", interval=interval)
         if resp.status_code >= 400:
-            raise ApiError(status=resp.status_code, body=resp.text, detail=_extract_detail(resp))
+            _raise_for_error(resp)
         body = resp.json()
         status_value = body.get("status", "")
         if status_value == "approved":
@@ -1743,6 +1760,7 @@ class ApiClient:
         url = f"{self._server_url}/api/v1/chat/send"
         headers = {
             "Authorization": f"Bearer {self._token.get_secret_value()}",
+            "User-Agent": USER_AGENT,
             "Accept": "text/event-stream",
         }
         payload: dict[str, Any] = {"message": message}
@@ -1774,11 +1792,7 @@ class ApiClient:
                 # Without this the body would be a closed stream by the
                 # time the caller sees the exception.
                 resp.read()
-                raise ApiError(
-                    status=resp.status_code,
-                    body=resp.text,
-                    detail=_extract_detail(resp),
-                )
+                _raise_for_error(resp)
             media_type = resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
             if media_type == "application/json":
                 # Older servers may ignore Accept and complete the turn as
@@ -1821,6 +1835,7 @@ class ApiClient:
         """
         headers = {
             "Authorization": f"Bearer {self._token.get_secret_value()}",
+            "User-Agent": USER_AGENT,
             "Accept": "text/event-stream",
         }
         if last_event_id is not None:
@@ -1840,11 +1855,7 @@ class ApiClient:
         ) as resp:
             if resp.status_code >= 400:
                 resp.read()
-                raise ApiError(
-                    status=resp.status_code,
-                    body=resp.text,
-                    detail=_extract_detail(resp),
-                )
+                _raise_for_error(resp)
             yield from _iter_feed_frames(resp.iter_lines())
 
     # ------------------------------------------------------------------
@@ -2429,7 +2440,10 @@ class ApiClient:
         written to disk.
         """
         url = f"{self._server_url}/api/v1/takeout"
-        headers = {"Authorization": f"Bearer {self._token.get_secret_value()}"}
+        headers = {
+            "Authorization": f"Bearer {self._token.get_secret_value()}",
+            "User-Agent": USER_AGENT,
+        }
         with self._client.stream("GET", url, headers=headers) as resp:
             # Strict 2xx here, not the >=400 the JSON paths use: httpx
             # doesn't follow redirects by default, and a 3xx body written
@@ -2440,11 +2454,7 @@ class ApiClient:
                 # Materialize the body so the ApiError can carry a detail
                 # message — same dance as the other error paths.
                 resp.read()
-                raise ApiError(
-                    status=resp.status_code,
-                    body=resp.text,
-                    detail=_extract_detail(resp),
-                )
+                _raise_for_error(resp)
             resolved_path = (
                 out_path
                 or _filename_from_content_disposition(resp.headers.get("content-disposition"))
@@ -2493,18 +2503,17 @@ class ApiClient:
         # Build the Authorization header from the wrapped token on
         # every call — keeps the plaintext off ``self`` and confined
         # to this stack frame.
-        headers = {"Authorization": f"Bearer {self._token.get_secret_value()}"}
+        headers = {
+            "Authorization": f"Bearer {self._token.get_secret_value()}",
+            "User-Agent": USER_AGENT,
+        }
         if extra_headers:
             headers.update(extra_headers)
         resp = self._client.request(
             method, url, json=json, params=params, files=files, headers=headers
         )
         if resp.status_code >= 400:
-            raise ApiError(
-                status=resp.status_code,
-                body=resp.text,
-                detail=_extract_detail(resp),
-            )
+            _raise_for_error(resp)
         return resp
 
 
@@ -2633,6 +2642,83 @@ def _scheduled_run_from_dict(row: dict[str, Any]) -> ScheduledTaskRunEntry:
         trajectory_id=row.get("trajectory_id"),
         reply_preview=row.get("reply_preview"),
     )
+
+
+#: Printed on a 426 whose body carries no usable instruction of its own.
+DEFAULT_UPGRADE_MESSAGE = (
+    "This version of pepper is no longer supported. Upgrade with: uv tool upgrade vycari-pepper"
+)
+
+_MAX_UPGRADE_MESSAGE_CHARS = 300
+
+# Whole terminal escape sequences, removed as units so no parameter bytes
+# (the ``[2J`` of a clear-screen) are left behind as litter. In order: OSC
+# (``ESC ]`` or C1 0x9d, up to BEL / ST), CSI (``ESC [`` or C1 0x9b), then any
+# other two-byte ``ESC x`` escape.
+_ESCAPE_SEQUENCE_RE = _re.compile(
+    r"(?:\x1b\]|\x9d)[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)?"
+    r"|(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]?"
+    r"|\x1b[ -/]*[0-~]?"
+)
+# Every remaining C0 control, DEL and C1 control except newline, which
+# :func:`_sanitize_terminal_line` uses to pick a line. Unicode line and
+# paragraph separators are handled by ``str.splitlines``.
+_CONTROL_CHAR_RE = _re.compile(r"[\x00-\x09\x0b-\x1f\x7f-\x9f]")
+# Invisible format characters that can reorder or hide what is displayed:
+# zero-width characters, bidirectional marks, embeddings, overrides and
+# isolates, and the byte-order mark.
+_INVISIBLE_FORMAT_RE = _re.compile(r"[\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]")
+
+
+def _sanitize_terminal_line(text: str, *, max_chars: int) -> str:
+    """First non-blank line of server-supplied ``text``, safe to print.
+
+    Server text is untrusted for terminal purposes: an escape sequence in it
+    could clear the screen, move the cursor or retitle the window. This drops
+    whole escape sequences and invisible format characters (bidirectional
+    overrides, zero-width characters), turns every other control character
+    into a space, collapses whitespace runs and caps the length. Returns
+    ``""`` when nothing printable is left.
+    """
+    text = _ESCAPE_SEQUENCE_RE.sub("", text)
+    text = _INVISIBLE_FORMAT_RE.sub("", text)
+    text = _CONTROL_CHAR_RE.sub(" ", text.replace("\r\n", "\n").replace("\r", "\n"))
+    for raw_line in text.splitlines():
+        line = " ".join(raw_line.split())
+        if line:
+            return line[:max_chars].rstrip()
+    return ""
+
+
+def _upgrade_message(resp: httpx.Response) -> str:
+    """The server's one-line upgrade instruction, or the built-in default.
+
+    Takes the JSON ``detail`` string when there is one, else the first line of
+    a plain-text body, else :data:`DEFAULT_UPGRADE_MESSAGE`. The text is
+    printed straight to the terminal, so it goes through
+    :func:`_sanitize_terminal_line` first. Needs a materialized body, like
+    :func:`_extract_detail`.
+    """
+    text = _extract_detail(resp)
+    if text is None:
+        try:
+            resp.json()
+        except ValueError:
+            # Not JSON at all: treat the body as the plain-text instruction.
+            text = resp.text
+    line = _sanitize_terminal_line(text or "", max_chars=_MAX_UPGRADE_MESSAGE_CHARS)
+    return line or DEFAULT_UPGRADE_MESSAGE
+
+
+def _raise_for_error(resp: httpx.Response) -> NoReturn:
+    """Raise for an error response (the body must already be read).
+
+    The one place a status >= 400 becomes an exception: 426 becomes
+    :class:`UpgradeRequiredError`, everything else :class:`ApiError`.
+    """
+    if resp.status_code == 426:
+        raise UpgradeRequiredError(_upgrade_message(resp))
+    raise ApiError(status=resp.status_code, body=resp.text, detail=_extract_detail(resp))
 
 
 def _extract_detail(resp: httpx.Response) -> str | None:

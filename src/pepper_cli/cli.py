@@ -270,6 +270,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     handler = args.handler
     try:
         return handler(args)
+    except api_client.UpgradeRequiredError as exc:
+        # A 426 from any request: the server no longer supports this client
+        # version. Raised past every per-command ``except ApiError``, so one
+        # handler covers all commands (and the REPL) with no traceback.
+        print(exc.message, file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
         # Ctrl-C inside an interactive prompt or a long-running turn.
         # Print a newline so the next shell prompt isn't pasted onto
