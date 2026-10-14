@@ -6,4 +6,6 @@ iOS / Android ports use as a reference). The ``credentials`` and
 ``render`` modules are implementation details.
 """
 
-__version__ = "0.0.1"
+from pepper_cli._version import get_version
+
+__version__ = get_version()

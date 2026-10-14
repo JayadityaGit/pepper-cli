@@ -380,6 +380,14 @@ server's own fields; `note` is the plan summary, or the unranked notice on the f
 - **"refusing to read credentials" permissions error** → `chmod 600
   ~/.config/pepper/credentials.toml`.
 
+## Versioning
+
+`pepper` follows [SemVer](https://semver.org/) starting at 0.1.0. While the version is 0.x, a
+minor bump may change flags or output. Within a minor version, fields in `--json` output are
+added, never removed. `pepper --version` prints the installed version, and every request sends
+it as `User-Agent: pepper-cli/<version>`; a server that no longer supports an old release answers
+`426 Upgrade Required`, and `pepper` prints the server's upgrade instruction and exits non-zero.
+
 ## Developing the CLI
 
 ```bash
