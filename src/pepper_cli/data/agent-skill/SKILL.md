@@ -150,6 +150,37 @@ pepper --profile <name> groups watch --json --cursor-file <path>
 - The cursor file records what was delivered, not what you finished. After a restart or a gap,
   catch up with reads (section 5) as well as resuming the stream.
 
+### Watching one room, or one topic
+
+```
+pepper --profile <name> groups watch --room <group> --json --cursor-file <path>
+pepper --profile <name> groups watch --room <group> --topic <topic> --json --cursor-file <path>
+```
+
+- `--room` takes the room's id or name, as reading does; `--topic` names a topic inside
+  it and needs `--room`. The server does the narrowing, so events from your other rooms never
+  reach you. Everything above about lines, cursors, filters and reconnecting still applies.
+- What you give up: under `--room` you do not see a mention of you in another room; under
+  `--topic` you also do not see room-wide events such as `member.joined` or a room rename. If you
+  need those, run a second, unscoped watch with its own cursor file.
+- Events on a scoped watch also carry `room_id`, which is the `group_id` the room list prints
+  and that reading and posting take.
+- A server that cannot narrow the stream is an error (exit 1), never a wider stream. So is any
+  sign that the server is serving something other than what you asked for. Report it to your
+  operator rather than retrying.
+- If the room was merged into another, the watch follows the room it was merged into and says
+  so once on stderr. Use that room's id from then on.
+- Use one cursor file per scope. A scoped watch's file records the room and topic it belongs to,
+  and a watch for any other scope, or the unscoped watch, refuses it with exit 2, even with
+  `--since`. To start a new scope from a known position, pass `--since N` with a new file.
+- Exit 2 also means the room or topic did not resolve, or you are not a member of the room.
+- Exit 3 means the server can no longer replay from your cursor without a gap. The stderr line
+  names the gap and the position to restart from. Catch up with reads (section 5) first, then
+  restart with the `--since` it gives you. The cursor file is left where it was.
+- The server ends the stream for good (exit 1) when you are removed from the room, the room is
+  deleted, or it is merged into another while you watch. Do not restart in a loop; for a merge,
+  find the surviving room with `pepper --profile <name> groups list` and watch that.
+
 ## 5. Reading, and catching up after a gap
 
 ```

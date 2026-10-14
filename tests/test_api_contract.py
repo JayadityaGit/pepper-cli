@@ -106,6 +106,27 @@ NOT_CHECKABLE: dict[tuple[str, str], NotCheckable] = {
         route=("GET", "/api/v1/groups/events/stream"),
         media=_JSON + _SSE,
     ),
+    ("api_client.py", "src/pepper/api/groups.py::room_events_stream"): NotCheckable(
+        "Names the room-scoped event-feed SSE route (FeedFrame). The snapshot lists the route "
+        "with an empty response schema and does not describe the stream frames.",
+        route=("GET", "/api/v1/groups/{group_id}/events/stream"),
+        media=_JSON + _SSE,
+    ),
+    ("api_client.py", "src/pepper/api/groups.py::topic_events_stream"): NotCheckable(
+        "Names the topic-scoped event-feed SSE route (FeedFrame). The snapshot lists the route "
+        "with an empty response schema and does not describe the stream frames.",
+        route=("GET", "/api/v1/groups/{group_id}/topics/{topic_id}/events/stream"),
+        media=_JSON + _SSE,
+    ),
+    (
+        "api_client.py",
+        "src/pepper/gateway/channels/groups_service/agent_feed.py::scope_frame",
+    ): NotCheckable(
+        "Names the function that builds the scoped stream's first frame (WatchScope). It is "
+        "an SSE frame on the scoped routes, which the snapshot does not describe.",
+        route=("GET", "/api/v1/groups/{group_id}/events/stream"),
+        media=_JSON + _SSE,
+    ),
     ("api_client.py", "src/pepper/api/router.py::chat_send"): NotCheckable(
         "Names the chat route whose SSE path emits StreamEvent frames. The snapshot describes "
         "only the JSON reply (ChatSendResponse, mirrored on ChatReply), not the stream "

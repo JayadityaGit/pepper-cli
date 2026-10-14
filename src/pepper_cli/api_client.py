@@ -24,7 +24,7 @@ import contextlib
 import json as _json
 import os
 import re as _re
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from dataclasses import dataclass, field
 from typing import Any, NoReturn, Self
 
@@ -266,31 +266,86 @@ def _room_skill_from_dict(row: dict) -> RoomSkill:
 
 
 # MIRROR: src/pepper/api/groups.py::agent_events_stream
-# (SSE route; frames are not described by the snapshot)
+# MIRROR: src/pepper/api/groups.py::room_events_stream
+# MIRROR: src/pepper/api/groups.py::topic_events_stream
+# (SSE routes; frames are not described by the snapshot)
 @dataclass(frozen=True)
 class FeedFrame:
     """One SSE frame from ``GET /api/v1/groups/events/stream`` (an agent member's
-    event feed).
+    event feed), or from one of its scoped forms,
+    ``GET /api/v1/groups/{gid}/events/stream`` and
+    ``GET /api/v1/groups/{gid}/topics/{tid}/events/stream``.
 
     ``kind`` is the frame's ``event:`` line: ``"cursor"`` (``payload`` is
     ``{"cursor": N}``, a resume point past events the agent was not in scope
     for), ``"error"`` (``payload`` is ``{"error": slug, "retry": bool}`` and
-    the server closes after it), or an event kind such as
+    the server closes after it), ``"scope"`` (scoped streams only: the first
+    data frame, see :class:`WatchScope`), or an event kind such as
     ``"message.created"`` (``payload`` is the event: ``id``, ``kind``,
-    ``group_id``, ``person_id``, ``payload``, ``created_at``).
+    ``group_id``, ``person_id``, ``payload``, ``created_at``, and on a scoped
+    stream ``room_id``).
 
     ``"comment"`` (empty ``payload``) stands for an SSE comment line, the
     server's ``: connected`` / ``: ping`` heartbeat: it carries nothing to act
     on but tells the caller the connection is healthy.
 
     ``id`` is the frame's SSE ``id:``: for an event frame the event id, for a
-    ``cursor`` frame the cursor, ``None`` on ``error``. Either is a valid
-    ``Last-Event-ID`` to resume after.
+    ``cursor`` frame the cursor, ``None`` on ``error`` and ``scope``. Either
+    of the first two is a valid ``Last-Event-ID`` to resume after.
     """
 
     kind: str
     id: int | None
     payload: dict[str, Any]
+
+
+# MIRROR: src/pepper/gateway/channels/groups_service/agent_feed.py::scope_frame
+# (the ``scope`` frame's data; SSE frames are not described by the snapshot)
+@dataclass(frozen=True)
+class WatchScope:
+    """What a scoped event stream says it resolved, before it sends any event.
+
+    ``requested_room_id`` is the room id the client put in the path.
+    ``room_id`` is the room the stream is actually scoped to: the same id,
+    unless the requested room was merged into another, in which case it is
+    the surviving room. ``service_group_id`` is the id event frames carry as
+    ``group_id``. ``topic_id`` is ``None`` for a room-scoped stream.
+    ``agent_person_id`` is the agent's own person id in the groups service.
+    """
+
+    room_id: str
+    requested_room_id: str
+    service_group_id: str
+    topic_id: str | None
+    agent_person_id: str
+
+
+#: The ``v`` a ``scope`` frame must carry for :func:`watch_scope_from_frame`
+#: to read it. A different version is a frame this client does not understand.
+WATCH_SCOPE_VERSION = 1
+
+
+def watch_scope_from_frame(frame: FeedFrame) -> WatchScope | None:
+    """The :class:`WatchScope` a ``scope`` frame carries, or ``None`` when the
+    frame is not a ``scope`` frame this client can read (another kind, another
+    ``v``, a missing or non-string id). ``None`` is never a scope to trust."""
+    if frame.kind != "scope" or frame.payload.get("v") != WATCH_SCOPE_VERSION:
+        return None
+    data = frame.payload
+    ids = [data.get(k) for k in ("room_id", "requested_room_id", "service_group_id")]
+    agent = data.get("agent_person_id")
+    topic = data.get("topic_id")
+    if not all(isinstance(v, str) and v for v in [*ids, agent]):
+        return None
+    if topic is not None and not (isinstance(topic, str) and topic):
+        return None
+    return WatchScope(
+        room_id=data["room_id"],
+        requested_room_id=data["requested_room_id"],
+        service_group_id=data["service_group_id"],
+        topic_id=topic,
+        agent_person_id=data["agent_person_id"],
+    )
 
 
 # MIRROR: src/pepper/api/router.py::chat_send
@@ -773,6 +828,11 @@ class GroupList:
     whether to offer a Groups surface at all. ``degraded`` means something
     different — "could not ask" — and a client tracking unread must hold its
     last-known state rather than read it as "all caught up".
+
+    ``features`` names what the server can do beyond the base surface. A
+    server that predates the field sends none, which reads as "nothing
+    extra": ``"watch_scope"`` (the room- and topic-scoped event streams) is
+    used only when the server lists it.
     """
 
     enabled: bool
@@ -780,6 +840,7 @@ class GroupList:
     total: int
     archived_total: int
     groups: list[GroupSummary] = field(default_factory=list)
+    features: tuple[str, ...] = ()
 
 
 # MIRROR: src/pepper/api/groups.py::topic_messages
@@ -1865,6 +1926,41 @@ class ApiClient:
         surface as ``kind="comment"`` frames so the caller can tell a quiet
         healthy connection from a dead one.
         """
+        yield from self._stream_feed(
+            "/api/v1/groups/events/stream", since=since, last_event_id=last_event_id
+        )
+
+    def watch_scoped_events(
+        self,
+        room_id: str,
+        *,
+        topic_id: str | None = None,
+        since: int = 0,
+        last_event_id: int | None = None,
+    ) -> Generator[FeedFrame]:
+        """``GET /api/v1/groups/{room_id}/events/stream`` (or, with
+        ``topic_id``, ``.../topics/{topic_id}/events/stream``): the agent
+        feed narrowed by the server to one room, or one topic in it.
+
+        The same frames, cursor and resume rules as :meth:`watch_agent_events`,
+        plus a ``scope`` frame (see :func:`watch_scope_from_frame`) ahead of
+        the first event on every connection, naming the room and topic the
+        server is actually serving. A room the caller cannot see is a 404,
+        indistinguishable from one that does not exist; a topic that is not
+        in the room is a 404 too. This never falls back to the roster-wide
+        stream.
+        """
+        path = f"/api/v1/groups/{room_id}"
+        if topic_id is not None:
+            path += f"/topics/{topic_id}"
+        yield from self._stream_feed(
+            f"{path}/events/stream", since=since, last_event_id=last_event_id
+        )
+
+    def _stream_feed(
+        self, path: str, *, since: int, last_event_id: int | None
+    ) -> Generator[FeedFrame]:
+        """Open one SSE feed connection at ``path`` and yield its frames."""
         headers = {
             "Authorization": f"Bearer {self._token.get_secret_value()}",
             "User-Agent": USER_AGENT,
@@ -1875,7 +1971,7 @@ class ApiClient:
         base_timeout = self._client.timeout
         with self._client.stream(
             "GET",
-            f"{self._server_url}/api/v1/groups/events/stream",
+            f"{self._server_url}{path}",
             params={"since": since},
             headers=headers,
             timeout=httpx.Timeout(
@@ -1907,6 +2003,7 @@ class ApiClient:
             total=body["total"],
             archived_total=body["archived_total"],
             groups=[_group_summary_from_dict(g) for g in body.get("groups") or []],
+            features=tuple(f for f in body.get("features") or () if isinstance(f, str)),
         )
 
     def get_group(self, group_id: str) -> dict[str, Any]:
