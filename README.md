@@ -401,3 +401,13 @@ uv run ty check src/pepper_cli/
 The CLI mirrors the server's `/api/v1` response shapes (see the `# MIRROR:` comments
 in `src/pepper_cli/api_client.py`) and tolerates unknown fields and stream frames.
 `CLAUDE.md` describes the layout for contributors and coding agents.
+
+### API contract
+
+`contracts/api-v1.openapi.json` is a vendored copy of the server's published `/api/v1` schema
+(see `contracts/README.md`; do not hand-edit it). `tests/test_api_contract.py` checks every
+`# MIRROR:`-annotated dataclass against it: each field must be a property of the named server
+schema. Adding a field to a mirrored dataclass therefore needs the field in the snapshot first
+-- the server change lands, the snapshot is refreshed (a weekly workflow opens the PR), then the
+CLI change follows. A mirror the test cannot check must be listed, with a reason, in the test's
+allowlists.
