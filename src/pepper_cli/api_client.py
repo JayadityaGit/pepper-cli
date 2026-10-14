@@ -256,6 +256,8 @@ def _room_skill_from_dict(row: dict) -> RoomSkill:
     )
 
 
+# MIRROR: src/pepper/api/groups.py::agent_events_stream
+# (SSE route; frames are not described by the snapshot)
 @dataclass(frozen=True)
 class FeedFrame:
     """One SSE frame from ``GET /api/v1/groups/events/stream`` (an agent member's
@@ -282,6 +284,8 @@ class FeedFrame:
     payload: dict[str, Any]
 
 
+# MIRROR: src/pepper/api/router.py::chat_send
+# (SSE path of the chat route; frames are not described by the snapshot)
 @dataclass(frozen=True)
 class StreamEvent:
     """One SSE frame from ``POST /api/v1/chat/send`` (SSE path).
@@ -705,6 +709,8 @@ def device_poll(
 # ---------------------------------------------------------------------------
 
 
+# MIRROR: src/pepper/api/groups.py::room_topics
+# (route handler; the response is an untyped dict, so no snapshot schema)
 @dataclass(frozen=True)
 class GroupTopicSummary:
     """One topic, as the rooms list and the topic rail both send it.
@@ -726,6 +732,8 @@ class GroupTopicSummary:
     is_default: bool = False
 
 
+# MIRROR: src/pepper/api/groups.py::list_groups
+# (route handler; untyped dict response, no snapshot schema)
 @dataclass(frozen=True)
 class GroupSummary:
     """One room on ``GET /api/v1/groups``.
@@ -745,6 +753,8 @@ class GroupSummary:
     topics: list[GroupTopicSummary] = field(default_factory=list)
 
 
+# MIRROR: src/pepper/api/groups.py::list_groups
+# (route handler; untyped dict response, no snapshot schema)
 @dataclass(frozen=True)
 class GroupList:
     """``GET /api/v1/groups`` — and the capability signal for the surface.
@@ -763,6 +773,8 @@ class GroupList:
     groups: list[GroupSummary] = field(default_factory=list)
 
 
+# MIRROR: src/pepper/api/groups.py::topic_messages
+# (route handler; untyped dict response, no snapshot schema)
 @dataclass(frozen=True)
 class GroupCard:
     """One structured app card carried on a message (``cards[]``).
@@ -784,6 +796,8 @@ class GroupCard:
     summary_lines: list[str] = field(default_factory=list)
 
 
+# MIRROR: src/pepper/api/groups.py::topic_messages
+# (route handler; untyped dict response, no snapshot schema)
 @dataclass(frozen=True)
 class GroupMessage:
     """One message in a topic.
@@ -851,6 +865,8 @@ class GroupMessage:
     for_display_name: str | None = None
 
 
+# MIRROR: src/pepper/api/groups.py::topic_messages
+# (route handler; untyped dict response, no snapshot schema)
 @dataclass(frozen=True)
 class GroupMessagePage:
     """One page of a topic's messages, oldest-first.
@@ -866,6 +882,8 @@ class GroupMessagePage:
     permalink_target_missing: bool = False
 
 
+# MIRROR: src/pepper/api/groups.py::room_roster
+# (route handler; untyped dict response, no snapshot schema)
 @dataclass(frozen=True)
 class GroupRosterMember:
     """One addressable member. Pepper is prepended by the server and flagged
@@ -884,6 +902,8 @@ class GroupRosterMember:
     agent_profile: str | None = None
 
 
+# MIRROR: src/pepper/api/groups.py::app_launcher
+# (route handler; untyped dict response, no snapshot schema)
 @dataclass(frozen=True)
 class GroupAppTile:
     """One tile of a room's launcher. ``principal`` is the room, so opening
@@ -1039,6 +1059,8 @@ class ArtifactListResponse:
     items: list[ArtifactListItem] = field(default_factory=list)
 
 
+# MIRROR: src/pepper/agent/artifacts/applet.py::read_detail
+# (the detail route answers an untyped JSONResponse, no snapshot schema)
 @dataclass(frozen=True)
 class ArtifactDetail:
     """One opened artifact from ``GET /api/v1/artifacts/{id}/detail``.
@@ -1096,6 +1118,7 @@ def _artifact_detail_from_dict(body: dict[str, Any]) -> ArtifactDetail:
     )
 
 
+# MIRROR: src/pepper/api/artifacts.py::ArtifactCreateResponse
 @dataclass(frozen=True)
 class ArtifactCreateResult:
     """Response of ``POST /api/v1/artifacts/new`` (:meth:`ApiClient.create_artifact`).
