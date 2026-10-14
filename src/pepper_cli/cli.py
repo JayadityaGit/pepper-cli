@@ -98,6 +98,7 @@ from pepper_cli import (
 )
 from pepper_cli.provider import fs as provider_fs
 from pepper_cli.secret import SecretStr
+from pepper_cli.terminal_text import make_visible, sanitize_line
 
 #: Default server URL used by ``pepper login`` when ``--server`` is
 #: not provided and the user accepts the prompt default. Production
@@ -1310,7 +1311,13 @@ def _login_manual(server_url: str, raw_token: str | None) -> int:
         return 1
 
     path = credentials.save(server_url=server_url, token=token)
-    render.info(f"Logged in as [bold]{who.display_name}[/bold] ({who.email or 'no email'}).")
+    render.info(
+        render.styled(
+            "Logged in as ",
+            (sanitize_line(who.display_name), "bold"),
+            f" ({sanitize_line(who.email or 'no email')}).",
+        )
+    )
     render.info(f"Credentials written to {path}.")
     return 0
 
@@ -1381,7 +1388,11 @@ def _login_device(server_url: str, *, open_browser: bool) -> int:
         render.error(f"Couldn't reach {server_url}: {exc}")
         return 1
 
-    render.info(f"Confirm this code in your browser: [bold]{start.user_code}[/bold]")
+    render.info(
+        render.styled(
+            "Confirm this code in your browser: ", (sanitize_line(start.user_code), "bold")
+        )
+    )
     render.info(start.verification_url)
     if open_browser:
         # Best-effort only — a headless box / no default browser must
@@ -1444,7 +1455,13 @@ def _login_device(server_url: str, *, open_browser: bool) -> int:
         return 1
 
     path = credentials.save(server_url=server_url, token=token)
-    render.info(f"Logged in as [bold]{who.display_name}[/bold] ({who.email or 'no email'}).")
+    render.info(
+        render.styled(
+            "Logged in as ",
+            (sanitize_line(who.display_name), "bold"),
+            f" ({sanitize_line(who.email or 'no email')}).",
+        )
+    )
     render.info(f"Credentials written to {path}.")
     return 0
 
@@ -1462,11 +1479,12 @@ def cmd_whoami(args: argparse.Namespace) -> int:
     except httpx.RequestError as exc:
         render.error(f"Couldn't reach {creds.server_url}: {exc}")
         return 1
-    # Plain print to stdout — scriptable.
-    print(f"user_id: {who.user_id}")
-    print(f"display_name: {who.display_name}")
-    print(f"email: {who.email or ''}")
-    print(f"timezone: {who.timezone or ''}")
+    # Plain print to stdout — scriptable. Each value is server text on one
+    # line, so it is cleaned of terminal controls and line breaks.
+    print(f"user_id: {sanitize_line(who.user_id)}")
+    print(f"display_name: {sanitize_line(who.display_name)}")
+    print(f"email: {sanitize_line(who.email or '')}")
+    print(f"timezone: {sanitize_line(who.timezone or '')}")
     return 0
 
 
@@ -1657,13 +1675,18 @@ def _run_repl(
             if exc.status == 401:
                 return _report_api_error(exc)
             render.info(
-                f"[yellow]warning:[/yellow] couldn't load skills "
-                f"(HTTP {exc.status}); completion will only cover built-in commands."
+                render.styled(
+                    ("warning:", "yellow"),
+                    f" couldn't load skills (HTTP {exc.status}); "
+                    "completion will only cover built-in commands.",
+                )
             )
         except httpx.RequestError as exc:
             render.info(
-                f"[yellow]warning:[/yellow] couldn't load skills ({exc}); "
-                "completion will only cover built-in commands."
+                render.styled(
+                    ("warning:", "yellow"),
+                    f" couldn't load skills ({exc}); completion will only cover built-in commands.",
+                )
             )
 
         completer = _SlashCompleter(skills)
@@ -1674,10 +1697,13 @@ def _run_repl(
         )
 
         render.info(
-            f"Pepper REPL — connected to [bold]{creds.server_url}[/bold]. "
-            "Type / + Tab for commands, Ctrl-D to exit. "
-            "Run [bold]pepper --help[/bold] for non-chat subcommands "
-            "(login / whoami / logout)."
+            render.styled(
+                "Pepper REPL — connected to ",
+                (creds.server_url, "bold"),
+                ". Type / + Tab for commands, Ctrl-D to exit. Run ",
+                ("pepper --help", "bold"),
+                " for non-chat subcommands (login / whoami / logout).",
+            )
         )
         skill_names = {s.name for s in skills}
 
@@ -1846,8 +1872,11 @@ def _render_client_tools_ack(payload: dict) -> None:
         return
     for entry in payload.get("rejected") or []:
         render.info(
-            f"[yellow]note:[/yellow] the server dropped "
-            f"{entry.get('name')!r} ({entry.get('reason')})."
+            render.styled(
+                ("note:", "yellow"),
+                f" the server dropped {entry.get('name')!r} "
+                f"({sanitize_line(str(entry.get('reason')))}).",
+            )
         )
 
 
@@ -1888,7 +1917,12 @@ def _serve_client_tool_call(
             is_error=is_error,
         )
     except (api_client.ApiError, httpx.RequestError) as exc:
-        render.info(f"[yellow]note:[/yellow] couldn't return {name!r} to the server ({exc}).")
+        render.info(
+            render.styled(
+                ("note:", "yellow"),
+                f" couldn't return {name!r} to the server ({exc}).",
+            )
+        )
 
 
 def cmd_trajectory_show(args: argparse.Namespace) -> int:
@@ -2605,7 +2639,10 @@ def _room_skill_line(row: api_client.RoomSkill) -> str:
     if state:
         notes.append(state)
     marker = "*" if row.can_revoke else " "
-    return f"{marker} {row.name} — {row.description}  [{' · '.join(notes)}]  {row.id}"
+    # Written straight to stdout, not through rich: one line of server text.
+    return sanitize_line(
+        f"{marker} {row.name} — {row.description}  [{' · '.join(notes)}]  {row.id}"
+    )
 
 
 def _resolve_room_skill(api: api_client.ApiClient, value: str, group_id: str) -> str:
@@ -2634,7 +2671,8 @@ def _resolve_room_skill(api: api_client.ApiClient, value: str, group_id: str) ->
         soft_wrap=True,
     )
     for row in matches:
-        sys.stderr.write(f"  {row.id}  shared by {_room_skill_shared_by(row)} ({row.state})\n")
+        line = f"  {row.id}  shared by {_room_skill_shared_by(row)} ({row.state})"
+        sys.stderr.write(sanitize_line(line) + "\n")
     raise _BadInputError
 
 
@@ -2694,7 +2732,7 @@ def _cmd_room_skills_show(args: argparse.Namespace) -> int:
         note = f"(shared with this room by {_room_skill_shared_by(detail.row)}"
         state = _room_skill_state_note(detail.row)
         render.info(f"{note} — {state})" if state else f"{note})")
-        sys.stdout.write(skill_doc.compose_skill_md(_fields_from_detail(detail.skill)))
+        render.write_document(skill_doc.compose_skill_md(_fields_from_detail(detail.skill)))
         return 0
 
     return _with_api(run, _report_api_error)
@@ -2760,13 +2798,13 @@ def cmd_skills_list(args: argparse.Namespace) -> int:
     if yours:
         sys.stdout.write("Yours:\n")
         for row in yours:
-            sys.stdout.write(f"  {row.name} — {row.description}\n")
+            sys.stdout.write(sanitize_line(f"  {row.name} — {row.description}") + "\n")
     else:
         sys.stdout.write("Yours: (none yet — try `pepper skills new <name>`)\n")
     if builtin:
         sys.stdout.write("Built-in (edit creates an override on your account):\n")
         for row in builtin:
-            sys.stdout.write(f"  {row.name} — {row.description}\n")
+            sys.stdout.write(sanitize_line(f"  {row.name} — {row.description}") + "\n")
     return 0
 
 
@@ -2790,7 +2828,7 @@ def cmd_skills_show(args: argparse.Namespace) -> int:
         return 1
     if detail.builtin:
         render.info("(built-in — ``pepper skills edit`` creates an override on your account)")
-    sys.stdout.write(skill_doc.compose_skill_md(_fields_from_detail(detail)))
+    render.write_document(skill_doc.compose_skill_md(_fields_from_detail(detail)))
     return 0
 
 
@@ -3507,7 +3545,9 @@ def _watch_event_line(event: dict[str, Any], *, as_json: bool, cursor: int) -> s
         for key in ("topic_id", "message_id"):
             if payload.get(key):
                 parts.append(f"{key}={payload[key]}")
-    return " ".join(parts)
+    # The plain form is read by people as often as by scripts; the JSON form
+    # above is left exactly as the server sent it.
+    return sanitize_line(" ".join(parts))
 
 
 def cmd_groups_watch(args: argparse.Namespace) -> int:
@@ -3780,7 +3820,7 @@ def cmd_groups_post(args: argparse.Namespace) -> int:
         _print_json({**dataclasses.asdict(message), "topic_id": topic_id})
         return 0
     render.info("Posted.")
-    print(created["id"])
+    print(sanitize_line(str(created["id"])))
     return 0
 
 
@@ -3873,7 +3913,7 @@ def cmd_groups_new_topic(args: argparse.Namespace) -> int:
 
     def run(api: api_client.ApiClient) -> int:
         topic = api.create_group_topic(_need_group(api, args.group), name=" ".join(args.name))
-        print(topic.get("topic_id") or topic.get("id"))
+        print(sanitize_line(str(topic.get("topic_id") or topic.get("id"))))
         return 0
 
     return _with_api(run)
@@ -3931,7 +3971,7 @@ def cmd_groups_new(args: argparse.Namespace) -> int:
         made = api.create_group(people=[_handle_of(api, p) for p in args.people], name=args.name)
         if not made.get("created", True):
             render.info("That conversation already existed.")
-        print(made["group_id"])
+        print(sanitize_line(str(made["group_id"])))
         return 0
 
     return _with_api(run)
@@ -4015,14 +4055,14 @@ def cmd_groups_apps(args: argparse.Namespace) -> int:
             _print_json(tiles)
             return 0
         for t in tiles:
-            print(f"{t.title}  {t.app_key}")
+            print(sanitize_line(f"{t.title}  {t.app_key}"))
         if unavailable:
             render.info("(installed apps unavailable right now)")
         elif not tiles:
             print("(no apps installed)")
         catalog = (api.get_group(gid).get("apps") or {}).get("catalog") or []
         if catalog:
-            render.info("installable: " + ", ".join(a["app_key"] for a in catalog))
+            render.info("installable: " + ", ".join(sanitize_line(a["app_key"]) for a in catalog))
         return 0
 
     return _with_api(run)
@@ -4092,7 +4132,7 @@ def cmd_groups_sharing(args: argparse.Namespace) -> int:
                 chosen.get(c["calendar_id"])
                 or f"{defaults.get(c['calendar_id'], 'none')} (default)"
             )
-            print(f"{_cal_name(c)}  {level}")
+            print(sanitize_line(f"{_cal_name(c)}  {level}"))
         return 0
 
     return _with_api(run)
@@ -4126,7 +4166,8 @@ def cmd_groups_activity(args: argparse.Namespace) -> int:
         if args.json:
             _print_json(rows)
         for r in [] if args.json else rows:
-            render.info(f"{r['group_label']} / {r['topic_label']}  {r['author']}: {r['excerpt']}")
+            line = f"{r['group_label']} / {r['topic_label']}  {r['author']}: {r['excerpt']}"
+            render.info(sanitize_line(line))
         return 0
 
     return _with_api(run)
@@ -4140,7 +4181,7 @@ def cmd_groups_search(args: argparse.Namespace) -> int:
         if args.json:
             _print_json(rows)
         for r in [] if args.json else rows:
-            print(f"{r['group_name']} / {r['name']}  {r['topic_id']}")
+            print(sanitize_line(f"{r['group_name']} / {r['name']}  {r['topic_id']}"))
         return 0
 
     return _with_api(run)
@@ -4458,19 +4499,25 @@ def _save_conflict_copy(name: str, etag: str | None, text: str) -> str | None:
 
 
 def _print_note_diff(current_body: str, mine: str) -> None:
-    """Unified diff from the server's current body to the user's text,
+    r"""Unified diff from the server's current body to the user's text,
     written straight to stderr rather than through
     :func:`render.error` — a note's body can hold literal ``[``/``]``
-    characters that Rich's markup parser would misread."""
-    import difflib
+    characters that Rich's markup parser would misread.
+
+    The diff is taken over the raw bodies, so a change that is only an
+    escape sequence or a carriage return still shows up before the user
+    decides whether to overwrite; each diff line is then printed with its
+    control and invisible characters spelled out (``\x1b``) rather than
+    sent to the terminal live. Lines are split on ``\n`` alone so a stray
+    control character cannot itself end a line."""
+
+    def lines(text: str) -> list[str]:
+        return re.findall(r"[^\n]*\n|[^\n]+$", text)
 
     diff = difflib.unified_diff(
-        current_body.splitlines(keepends=True),
-        mine.splitlines(keepends=True),
-        fromfile="server (current)",
-        tofile="yours",
+        lines(current_body), lines(mine), fromfile="server (current)", tofile="yours"
     )
-    sys.stderr.writelines(diff)
+    sys.stderr.writelines(make_visible(line) for line in diff)
 
 
 def cmd_notes_new(args: argparse.Namespace) -> int:
@@ -4517,7 +4564,7 @@ def cmd_notes_new(args: argparse.Namespace) -> int:
         render.error(f"Couldn't reach {creds.server_url}: {exc}")
         return 1
     render.info(f"Created {result.name!r}.")
-    print(result.id)
+    print(sanitize_line(result.id))
     return 0
 
 

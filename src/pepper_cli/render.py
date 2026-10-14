@@ -14,6 +14,19 @@ helpers are used by the REPL to surface the model's interim work as
 each SSE frame arrives. They print to stderr so a hypothetical
 future ``pepper chat --stream MESSAGE | jq`` (out of scope today but
 plausible) wouldn't capture them in the piped output.
+
+Server text is untrusted here, for two reasons. Terminal control: an escape
+sequence in a room name or an error detail could clear the screen, retitle
+the window or plant a hyperlink, so every field goes through
+:mod:`pepper_cli.terminal_text` — one-line fields through ``sanitize_line``
+(via :func:`_s`), free text through ``sanitize_text`` — and both consoles
+carry a render hook that strips the same sequences from everything they
+print, as a backstop for any field a renderer forgets. Rich markup: a
+``[red]``- or ``[link=…]``-shaped name must print literally, so server text
+interpolated into a markup string is ``escape``'d (again :func:`_s`), and
+free text is printed on its own with ``markup=False``. ``info`` and
+``error`` never parse their message as markup; a caller that wants emphasis
+passes a :func:`styled` ``Text`` instead.
 """
 
 from __future__ import annotations
@@ -23,9 +36,13 @@ import sys
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from rich.console import Console
+from rich.console import Console, ConsoleOptions, ConsoleRenderable, RenderHook, RenderResult
 from rich.markdown import Markdown
 from rich.markup import escape
+from rich.segment import Segment
+from rich.text import Text
+
+from pepper_cli.terminal_text import sanitize_line, sanitize_text
 
 if TYPE_CHECKING:
     from pepper_cli.api_client import (
@@ -43,11 +60,72 @@ if TYPE_CHECKING:
         TrajectoryListEntry,
     )
 
+
+class _Sanitized:
+    """Wrap a renderable so the text it renders carries no terminal controls.
+
+    Works on the rendered segments, after markup has been parsed and before
+    rich adds its own styling, so rich's colours survive and only control
+    and escape characters inside the text itself are removed. Rich's own
+    control segments (cursor movement it emits on purpose) pass through.
+    """
+
+    def __init__(self, renderable: ConsoleRenderable) -> None:
+        self._renderable = renderable
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        """Render the wrapped object, cleaning each text segment."""
+        for segment in console.render(self._renderable, options):
+            if segment.control or not segment.text:
+                yield segment
+                continue
+            clean = sanitize_text(segment.text)
+            yield segment if clean == segment.text else Segment(clean, segment.style)
+
+
+class _StripTerminalControls(RenderHook):
+    """Backstop: every renderable printed on our consoles goes through :class:`_Sanitized`."""
+
+    def process_renderables(self, renderables: list[ConsoleRenderable]) -> list[ConsoleRenderable]:
+        """Wrap each renderable about to be printed."""
+        return [_Sanitized(r) for r in renderables]
+
+
+def _make_console(**kwargs: Any) -> Console:
+    """A rich console with the terminal-control backstop installed."""
+    console = Console(**kwargs)
+    console.push_render_hook(_StripTerminalControls())
+    return console
+
+
 # Lazy-ish: build the consoles once per process. ``no_color`` is left
 # to Rich's auto-detection so ``NO_COLOR=1`` and piped output both
 # produce plain text without explicit config here.
-_stdout = Console()
-_stderr = Console(stderr=True)
+_stdout = _make_console()
+_stderr = _make_console(stderr=True)
+
+
+def _s(value: object) -> str:
+    """A one-line server field, ready to interpolate into a markup string.
+
+    Control characters (line breaks included) become spaces and rich
+    markup is escaped, so the field can neither break its line nor style
+    or link anything.
+    """
+    return escape(sanitize_line(str(value)))
+
+
+def styled(*parts: str | tuple[str, str]) -> Text:
+    """Literal text with styled spans, for an :func:`info` line that wants emphasis.
+
+    Each part is a plain string or a ``(text, style)`` pair, as for
+    ``Text.assemble``. Every part's text is sanitized and none of it is
+    parsed as markup, so server text can go in any part.
+    """
+    return Text.assemble(
+        *(sanitize_text(p) if isinstance(p, str) else (sanitize_text(p[0]), p[1]) for p in parts)
+    )
+
 
 #: Cap on how much of a tool_result ``text`` we render inline. The
 #: server's ``_sanitize_step_value`` already truncates to 2KB, but the
@@ -67,11 +145,15 @@ def render_markdown(text: str) -> None:
     ``show > file.md`` followed by a later ``edit --file file.md`` round-trips
     cleanly instead of a no-op edit silently changing the stored body (and
     its etag) by one trailing newline.
+
+    Only the TTY branch is cleaned of terminal controls: that is the one
+    that reaches a terminal. Piped or redirected output belongs to the
+    reader on the other end, the same as ``--json``, and stays byte-exact.
     """
     if not sys.stdout.isatty():
         sys.stdout.write(text)
         return
-    _stdout.print(Markdown(text))
+    _stdout.print(Markdown(sanitize_text(text)))
 
 
 def render_reply(markdown_text: str) -> None:
@@ -89,11 +171,29 @@ def render_reply(markdown_text: str) -> None:
         sys.stdout.write("\n")
 
 
-def info(message: str) -> None:
+def write_document(text: str) -> None:
+    """Write a stored document (a skill's ``SKILL.md``) to stdout unrendered.
+
+    The same split as :func:`render_markdown`: byte-exact when stdout is
+    piped or redirected, so ``show > file`` round-trips into an edit, and
+    cleaned of terminal controls when it is a terminal.
+    """
+    sys.stdout.write(text if not sys.stdout.isatty() else sanitize_text(text))
+
+
+def info(message: str | Text) -> None:
     """Print a status line to stderr. Used for the chrome around
     commands ('Logged in as ...', 'Removed credentials at ...') so the
-    primary output channel stays clean for piping."""
-    _stderr.print(message)
+    primary output channel stays clean for piping.
+
+    A ``str`` message is printed literally: it is never parsed as rich
+    markup, because callers interpolate server text (an error detail, a
+    name) into it. Emphasis comes from passing a :func:`styled` ``Text``.
+    """
+    if isinstance(message, Text):
+        _stderr.print(message)
+    else:
+        _stderr.print(sanitize_text(message), markup=False)
 
 
 def error(message: str, *, soft_wrap: bool = False) -> None:
@@ -105,8 +205,13 @@ def error(message: str, *, soft_wrap: bool = False) -> None:
     would want to copy-paste (an ambiguous-name match listing, say) —
     Rich would otherwise fold it across lines at the terminal width,
     which breaks a paste of exactly the thing being offered.
+
+    ``message`` is printed literally, never parsed as rich markup: most
+    callers interpolate a server ``detail`` or name into it.
     """
-    _stderr.print(f"[red]error:[/red] {message}", soft_wrap=soft_wrap)
+    _stderr.print(
+        Text("error:", style="red"), sanitize_text(message), markup=False, soft_wrap=soft_wrap
+    )
 
 
 def render_thought_delta(text: str, *, first: bool) -> None:
@@ -126,6 +231,7 @@ def render_thought_delta(text: str, *, first: bool) -> None:
     ``markup=False`` matters here: a fragment is model text, and a stray
     ``[dim]``-shaped token in it must not be read as rich markup.
     """
+    text = sanitize_text(text)
     if not text:
         return
     if first:
@@ -180,10 +286,10 @@ def render_tool_call(payload: dict[str, Any]) -> None:
     Compact one-liner: ``→ name(arg=value, ...)``. Args dict is
     formatted with ``repr``-style truncation so a giant arg blob
     (e.g. a pasted email body) doesn't blow up the terminal."""
-    name = payload.get("name") or "<unknown>"
+    name = _s(payload.get("name") or "<unknown>")
     args = payload.get("args") or {}
     if isinstance(args, dict) and args:
-        rendered_args = ", ".join(f"{k}={_short(v)}" for k, v in args.items())
+        rendered_args = ", ".join(f"{_s(k)}={_s(_short(v))}" for k, v in args.items())
         _stderr.print(f"[cyan]→[/cyan] [bold]{name}[/bold]({rendered_args})")
     else:
         _stderr.print(f"[cyan]→[/cyan] [bold]{name}[/bold]()")
@@ -195,14 +301,14 @@ def render_tool_result(payload: dict[str, Any]) -> None:
     Status-coloured glyph + name + truncated result text. ``ok`` gets
     a green check; non-ok gets a yellow warning so a glance at the
     transcript surfaces the failures."""
-    name = payload.get("name") or "<unknown>"
+    name = _s(payload.get("name") or "<unknown>")
     status = payload.get("status") or "ok"
     text = payload.get("text") or ""
     glyph = "[green]✓[/green]" if status == "ok" else "[yellow]⚠[/yellow]"
     if text:
-        _stderr.print(f"{glyph} [bold]{name}[/bold] → {_short(text)}")
+        _stderr.print(f"{glyph} [bold]{name}[/bold] → {_s(_short(text))}")
     else:
-        _stderr.print(f"{glyph} [bold]{name}[/bold] ({status})")
+        _stderr.print(f"{glyph} [bold]{name}[/bold] ({_s(status)})")
 
 
 #: Per-event payload preview budget for ``pepper trajectory show``.
@@ -232,22 +338,23 @@ def render_trajectory(detail: TrajectoryDetail) -> None:
     traj = detail.trajectory
     closed = traj.closed_at or "(open)"
     _stdout.print(
-        f"trajectory [bold]{traj.id}[/bold] — user {traj.user_id} — channel {traj.channel}"
+        f"trajectory [bold]{_s(traj.id)}[/bold] — user {_s(traj.user_id)} "
+        f"— channel {_s(traj.channel)}"
     )
     # Its own line rather than appended to the header: a dated 1:1 key is
     # ~55 chars, and the point of printing it is that two trajectories'
     # keys can be compared at a glance.
     if traj.conversation_key:
-        _stdout.print(f"conversation {traj.conversation_key}")
-    _stdout.print(f"created {traj.created_at}  closed {closed}")
+        _stdout.print(f"conversation {_s(traj.conversation_key)}")
+    _stdout.print(f"created {_s(traj.created_at)}  closed {_s(closed)}")
     code_sha = traj.meta.get("code_sha") if isinstance(traj.meta, dict) else None
     if isinstance(code_sha, str) and code_sha:
         dirty = " (dirty)" if traj.meta.get("code_dirty") else ""
-        _stdout.print(f"code {code_sha[:12]}{dirty}")
+        _stdout.print(f"code {_s(code_sha[:12])}{dirty}")
     _stdout.print(f"{len(detail.events)} events:")
     for ev in detail.events:
         payload_str = _short_json(ev.payload, _TRAJECTORY_EVENT_PREVIEW_CHARS)
-        _stdout.print(f"[{ev.seq}] {ev.event_type}: {payload_str}")
+        _stdout.print(f"[{ev.seq}] {_s(ev.event_type)}: {_s(payload_str)}")
 
 
 def render_trajectory_list(rows: list[TrajectoryListEntry]) -> None:
@@ -261,16 +368,16 @@ def render_trajectory_list(rows: list[TrajectoryListEntry]) -> None:
         _stdout.print("(no trajectories)")
         return
     for row in rows:
-        tag = f" [group:{row.group_name}]" if row.group_name else ""
+        tag = f" {_s(f'[group:{row.group_name}]')}" if row.group_name else ""
         preview = ""
         if row.first_user_message:
-            snippet = row.first_user_message.strip().replace("\n", " ")
+            snippet = sanitize_line(row.first_user_message).strip()
             if len(snippet) > 80:
                 snippet = snippet[:80] + "…"
-            preview = f" — {snippet}"
+            preview = f" — {escape(snippet)}"
         _stdout.print(
-            f"{row.created_at}  [bold]{row.id}[/bold]  "
-            f"{row.channel}{tag}  ({row.event_count} events){preview}"
+            f"{_s(row.created_at)}  [bold]{_s(row.id)}[/bold]  "
+            f"{_s(row.channel)}{tag}  ({row.event_count} events){preview}"
         )
 
 
@@ -294,12 +401,12 @@ def render_todo_list(rows: list[TodoEntry]) -> None:
         return
     for row in rows:
         marker = _TODO_MARKERS.get(row.status, "•")
-        line = f"{marker} {row.title}"
+        line = f"{marker} {_s(row.title)}"
         if row.due_date:
-            line += f"  due {_format_due(row.due_date, row.due_is_date_only)}"
+            line += f"  due {_s(_format_due(row.due_date, row.due_is_date_only))}"
         if row.priority:
-            line += f"  ({row.priority})"
-        line += f"  [dim]{row.id}[/dim]"
+            line += f"  ({_s(row.priority)})"
+        line += f"  [dim]{_s(row.id)}[/dim]"
         _stdout.print(line)
 
 
@@ -312,13 +419,13 @@ def _calendar_event_line(ev: dict[str, Any]) -> str:
         when = "all day"
     else:
         when = f"{ev.get('start_label') or ''}-{ev.get('end_label') or ''}".strip("-")
-    title = escape(ev.get("summary") or "(no title)")
-    line = f"{'>' if ev.get('is_next') else ' '} {escape(when):<16} {title}"
+    title = _s(ev.get("summary") or "(no title)")
+    line = f"{'>' if ev.get('is_next') else ' '} {_s(when):<16} {title}"
     if ev.get("location"):
-        line += f"  @ {escape(ev['location'])}"
+        line += f"  @ {_s(ev['location'])}"
     conf = ev.get("conference")
     if isinstance(conf, dict) and conf.get("url"):
-        line += f"  {escape('[' + (conf.get('name') or 'call') + ']')}"
+        line += f"  {_s('[' + (conf.get('name') or 'call') + ']')}"
     if ev.get("my_response") in ("declined", "tentative"):
         line += f"  ({ev['my_response']})"
     if ev.get("kind") in _IMPUTED:
@@ -344,29 +451,29 @@ def _day_rows(day: dict[str, Any], mode: str) -> list[tuple[tuple[bool, datetime
         rows.append((_sort_key(bool(ev.get("all_day")), ev.get("start")), _calendar_event_line(ev)))
     if mode == "schedule":
         for todo in day.get("deadlines") or []:
-            due = escape(f"due {todo.get('time') or ''}")
-            line = f"  {due:<16} {escape(todo.get('title') or '')}"
+            due = _s(f"due {todo.get('time') or ''}")
+            line = f"  {due:<16} {_s(todo.get('title') or '')}"
             rows.append((_sort_key(False, todo.get("sort_key")), line))
         for meal in day.get("meals") or []:
             if meal.get("name"):
-                slot = escape(str(meal.get("slot") or "meal"))
-                rows.append((_sort_key(False, None), f"  {slot:<16} {escape(meal['name'])}"))
+                slot = _s(str(meal.get("slot") or "meal"))
+                rows.append((_sort_key(False, None), f"  {slot:<16} {_s(meal['name'])}"))
     if mode == "planning":
         for win in day.get("meal_windows") or []:
             when = f"{win.get('start_label') or ''}-{win.get('end_label') or ''}"
-            dish = f" - {escape(win['dish'])}" if win.get("dish") else ""
-            name = escape(win.get("label") or "Meal")
-            line = f"  {escape(when):<16} {name} [dim](meal window){dish}[/dim]"
+            dish = f" - {_s(win['dish'])}" if win.get("dish") else ""
+            name = _s(win.get("label") or "Meal")
+            line = f"  {_s(when):<16} {name} [dim](meal window){dish}[/dim]"
             rows.append((_sort_key(False, win.get("start")), line))
     for leg in day.get("travel") or []:
         facts = leg.get("facts") or {}
         if facts.get("ok"):
             slack = facts.get("spare_minutes")
             tight = f", {-slack} min late" if isinstance(slack, int) and slack < 0 else ""
-            drive = escape(f"drive {facts['minutes']} min")
+            drive = _s(f"drive {facts['minutes']} min")
             line = (
-                f"  [dim]{drive:<16} to {escape(leg.get('to') or '')}, "
-                f"arrive {escape(facts.get('arrive_at') or '')}{tight}[/dim]"
+                f"  [dim]{drive:<16} to {_s(leg.get('to') or '')}, "
+                f"arrive {_s(facts.get('arrive_at') or '')}{tight}[/dim]"
             )
             rows.append((_sort_key(False, leg.get("after")), line))
     return sorted(rows, key=lambda r: r[0])
@@ -385,9 +492,9 @@ def _proposed_rows(plan: dict[str, Any]) -> list[tuple[tuple[bool, datetime], st
     for b in (chosen or {}).get("blocks") or []:
         if b.get("type") != "todo" or b.get("done") or b.get("on_calendar"):
             continue
-        when = escape(f"{b['start_label']}-{b['end_label']}")
-        why = f" - {escape(b['reason'])}" if b.get("reason") else ""
-        line = f"  {when:<16} {escape(b['title'])}  [dim](proposed todo block{why})[/dim]"
+        when = _s(f"{b['start_label']}-{b['end_label']}")
+        why = f" - {_s(b['reason'])}" if b.get("reason") else ""
+        line = f"  {when:<16} {_s(b['title'])}  [dim](proposed todo block{why})[/dim]"
         rows.append((_sort_key(False, b["start"]), line))
     return rows
 
@@ -406,7 +513,7 @@ def _conditions_line(env: dict[str, Any], date: str) -> str | None:
         if wx.get("severe"):
             parts.append("severe weather")
     parts += [solar[k] for k in ("sunrise_label", "sunset_label") if solar.get(k)]
-    return f"  [dim]{escape(' | '.join(parts))}[/dim]" if parts else None
+    return f"  [dim]{_s(' | '.join(parts))}[/dim]" if parts else None
 
 
 def render_calendar(
@@ -446,19 +553,19 @@ def render_calendar(
             tag = " (ongoing)" if ev.get("ongoing") else ""
             if ev.get("kind") in _IMPUTED:
                 tag += f"  [dim]({_IMPUTED[ev['kind']]})[/dim]"
-            out(f"  {escape(ev.get('range_label') or '')}  {escape(ev.get('summary') or '')}{tag}")
+            out(f"  {_s(ev.get('range_label') or '')}  {_s(ev.get('summary') or '')}{tag}")
         out()
     for day in days:
         label, date_label = day.get("label") or "", day.get("date_label") or ""
-        extra = f" [dim]{escape(date_label)}[/dim]" if date_label != label else ""
-        out(f"[bold]{escape(label)}[/bold]{extra}")
+        extra = f" [dim]{_s(date_label)}[/dim]" if date_label != label else ""
+        out(f"[bold]{_s(label)}[/bold]{extra}")
         env = payload.get("environment")
         if env and (conditions := _conditions_line(env, day.get("date") or "")):
             out(conditions)
         if env and day.get("date") == (window and min(window)):
             out_bands = [b.get("label") for b in env.get("precipitation") or []]
             if out_bands:
-                out(f"  [dim]{escape('precipitation: ' + '; '.join(out_bands))}[/dim]")
+                out(f"  [dim]{_s('precipitation: ' + '; '.join(out_bands))}[/dim]")
         rows = _day_rows(day, mode)
         plan = payload.get("schedule_plan")
         if mode == "schedule" and plan and plan.get("date") == day.get("date"):
@@ -472,7 +579,7 @@ def render_calendar(
         # No calendar days (not connected) but todos still get a plan.
         proposed = _proposed_rows(plan)
         if proposed:
-            out(f"[bold]{escape(plan['date'])}[/bold]")
+            out(f"[bold]{_s(plan['date'])}[/bold]")
             for _, line in sorted(proposed, key=lambda r: r[0]):
                 out(line)
     if not days and payload.get("state") not in (None, "connected"):
@@ -480,9 +587,9 @@ def render_calendar(
     if cards:
         out("\n[bold]Suggestions[/bold] [dim](not on your calendar)[/dim]")
         for card in cards:
-            why = f" - {escape(card['rationale'])}" if card.get("rationale") else ""
-            kind = escape(f"[{card.get('kind')}]")
-            out(f"  {kind} {escape(card.get('title') or '')}{why}")
+            why = f" - {_s(card['rationale'])}" if card.get("rationale") else ""
+            kind = _s(f"[{card.get('kind')}]")
+            out(f"  {kind} {_s(card.get('title') or '')}{why}")
     if payload.get("truncated"):
         out("[dim](more events than shown; try fewer days)[/dim]")
 
@@ -513,7 +620,7 @@ def _describe_destinations(destinations: list[str] | None) -> str:
         return "your default"
     if not destinations:
         return "nobody (silent)"
-    return ", ".join(_DESTINATION_LABELS.get(d, d) for d in destinations)
+    return ", ".join(_s(_DESTINATION_LABELS.get(d, d)) for d in destinations)
 
 
 def render_scheduled_task_list(rows: list[ScheduledTaskSummary]) -> None:
@@ -528,37 +635,39 @@ def render_scheduled_task_list(rows: list[ScheduledTaskSummary]) -> None:
         return
     for row in rows:
         glyph = "[green]●[/green]" if row.active else "[dim]○[/dim]"
-        schedule = "one-off" if row.one_shot else f"cron {row.cron}"
-        line = f"{glyph} {row.name}  {schedule}"
+        schedule = "one-off" if row.one_shot else f"cron {_s(row.cron)}"
+        line = f"{glyph} {_s(row.name)}  {schedule}"
         # A paused row's next_run_at is whatever it held when it stopped —
         # printing it as "next" would be a lie, so say what it is instead.
-        line += f"  {'next' if row.active else 'was due'} {_format_stamp(row.next_run_at)}"
+        line += f"  {'next' if row.active else 'was due'} {_s(_format_stamp(row.next_run_at))}"
         # A room's row carries the server's own sentence: its ``None`` is the
         # room's default, which "your default" would misdescribe.
         # (``getattr``: this module imports the wire types for checking only.)
         delivery = getattr(row, "delivery", None)
         if delivery is not None:
-            line += f"  → {escape(delivery)}"
+            line += f"  → {_s(delivery)}"
             last_run_status = getattr(row, "last_run_status", None)
             if last_run_status:
-                line += f"  last run {escape(last_run_status)}"
+                line += f"  last run {_s(last_run_status)}"
         else:
             line += f"  → {_describe_destinations(row.destinations)}"
-        line += f"  [dim]{row.id}[/dim]"
+        line += f"  [dim]{_s(row.id)}[/dim]"
         _stdout.print(line)
 
 
 def render_scheduled_task(detail: ScheduledTaskDetail) -> None:
     """Pretty-print one task's configuration and its most recent fire."""
     state = "active" if detail.active else "paused"
-    _stdout.print(f"[bold]{detail.name}[/bold] ({state})  [dim]{detail.id}[/dim]")
+    _stdout.print(f"[bold]{_s(detail.name)}[/bold] ({state})  [dim]{_s(detail.id)}[/dim]")
     if detail.description:
-        _stdout.print(detail.description)
-    schedule = "one-off" if detail.one_shot else f"cron {detail.cron}"
+        # Free text, on a line of its own: kept multi-line, never parsed as markup.
+        _stdout.print(sanitize_text(detail.description), markup=False)
+    schedule = "one-off" if detail.one_shot else f"cron {_s(detail.cron)}"
     if detail.timezone:
-        schedule += f" ({detail.timezone})"
+        schedule += f" ({_s(detail.timezone)})"
     _stdout.print(f"schedule {schedule}")
-    _stdout.print(f"{'next' if detail.active else 'was due'} {_format_stamp(detail.next_run_at)}")
+    stamp = _s(_format_stamp(detail.next_run_at))
+    _stdout.print(f"{'next' if detail.active else 'was due'} {stamp}")
     _stdout.print(f"delivered to {_describe_destinations(detail.destinations)}")
     if detail.latest_run is None:
         _stdout.print("last run (never fired)")
@@ -573,15 +682,15 @@ def render_scheduled_task_runs(rows: list[ScheduledTaskRunEntry]) -> None:
         _stdout.print("(no runs yet)")
         return
     for row in rows:
-        line = f"{_format_stamp(row.fired_at)}  {row.status}"
+        line = f"{_s(_format_stamp(row.fired_at))}  {_s(row.status)}"
         if row.delivered_channels:
             line += f"  → {_describe_destinations(row.delivered_channels)}"
         if row.error:
-            line += f"  [red]{_short(row.error)}[/red]"
+            line += f"  [red]{_s(_short(row.error))}[/red]"
         elif row.reply_preview:
-            line += f"  {_short(row.reply_preview)}"
+            line += f"  {_s(_short(row.reply_preview))}"
         if row.trajectory_id:
-            line += f"  [dim]{row.trajectory_id}[/dim]"
+            line += f"  [dim]{_s(row.trajectory_id)}[/dim]"
         _stdout.print(line)
 
 
@@ -591,8 +700,10 @@ def render_scheduled_task_thread(rows: list[ScheduledTaskMessage]) -> None:
         _stdout.print("(no messages in this task's thread)")
         return
     for row in rows:
-        _stdout.print(f"[dim]{_format_stamp(row.created_at)}[/dim] [bold]{row.role}[/bold]:")
-        _stdout.print(row.text)
+        _stdout.print(
+            f"[dim]{_s(_format_stamp(row.created_at))}[/dim] [bold]{_s(row.role)}[/bold]:"
+        )
+        _stdout.print(sanitize_text(row.text), markup=False)
 
 
 #: Server-recognized ``kind`` values (mirrors
@@ -636,8 +747,8 @@ def render_group_list(gl: GroupList) -> None:
         # person is likely to copy-paste, and Rich's default wrapping would
         # otherwise fold it across two lines at the terminal width.
         _stdout.print(
-            f"{escape(g.display_name)}{tag}  {g.member_count} members  "
-            f"{g.sub}  [dim]{g.group_id}[/dim]",
+            f"{_s(g.display_name)}{tag}  {g.member_count} members  "
+            f"{_s(g.sub)}  [dim]{_s(g.group_id)}[/dim]",
             soft_wrap=True,
         )
 
@@ -652,8 +763,8 @@ def render_group_topics(rows: list[GroupTopicSummary]) -> None:
         tag = " [dim](archived)[/dim]" if t.archived_at is not None else ""
         # soft_wrap: same reasoning as render_group_list — don't fold the id.
         _stdout.print(
-            f"{escape(t.name)}{tag}  active {_format_stamp(t.last_activity_at)}  "
-            f"[dim]{t.topic_id}[/dim]",
+            f"{_s(t.name)}{tag}  active {_s(_format_stamp(t.last_activity_at))}  "
+            f"[dim]{_s(t.topic_id)}[/dim]",
             soft_wrap=True,
         )
 
@@ -667,7 +778,7 @@ def render_group_roster(rows: list[GroupRosterMember]) -> None:
     for m in rows:
         tag = " [dim](Pepper)[/dim]" if m.is_pepper else " [dim](agent)[/dim]" if m.is_agent else ""
         # soft_wrap: the id is what a person copies — same as the lists above.
-        _stdout.print(f"{escape(m.display_name)}{tag}  [dim]{m.person_id}[/dim]", soft_wrap=True)
+        _stdout.print(f"{_s(m.display_name)}{tag}  [dim]{_s(m.person_id)}[/dim]", soft_wrap=True)
 
 
 def render_group_detail(detail: dict[str, Any]) -> None:
@@ -688,27 +799,27 @@ def render_group_detail(detail: dict[str, Any]) -> None:
     unmatched tag.
     """
     kind = detail.get("kind")
-    kind_label = _KIND_LABELS.get(kind, kind or "unknown")
+    kind_label = _s(_KIND_LABELS.get(kind, kind or "unknown"))
     _stdout.print(
-        f"[bold]{escape(detail.get('display_name') or '(unnamed)')}[/bold]  ({kind_label})  "
-        f"[dim]{detail.get('group_id', '')}[/dim]"
+        f"[bold]{_s(detail.get('display_name') or '(unnamed)')}[/bold]  ({kind_label})  "
+        f"[dim]{_s(detail.get('group_id', ''))}[/dim]"
     )
     members = detail.get("members") or []
     _stdout.print(f"members ({len(members)}):")
     for m in members:
         you = " [dim](you)[/dim]" if m.get("is_you") else ""
-        role = m.get("role") or "member"
+        role = _s(m.get("role") or "member")
         agent = ""
         if m.get("is_agent"):
             sponsor = m.get("sponsor_display_name")
-            run_by = f", run by {escape(sponsor)}" if sponsor else ""
+            run_by = f", run by {_s(sponsor)}" if sponsor else ""
             agent = f" [dim](agent{run_by})[/dim]"
-        _stdout.print(f"  {escape(m.get('display_name') or 'Someone')}{you}{agent}  — {role}")
+        _stdout.print(f"  {_s(m.get('display_name') or 'Someone')}{you}{agent}  — {role}")
     topics = detail.get("topics") or []
     _stdout.print(f"topics ({len(topics)}):")
     for t in topics:
         tag = " [dim](archived)[/dim]" if t.get("archived") else ""
-        _stdout.print(f"  {escape(t.get('name') or '')}{tag}")
+        _stdout.print(f"  {_s(t.get('name') or '')}{tag}")
     apps = detail.get("apps") or {}
     if apps.get("unavailable"):
         _stdout.print("apps: [dim](unavailable — couldn't ask)[/dim]")
@@ -717,7 +828,7 @@ def render_group_detail(detail: dict[str, Any]) -> None:
         if installed:
             _stdout.print("apps:")
             for a in installed:
-                _stdout.print(f"  {escape(a.get('title') or a.get('app_key') or '')}")
+                _stdout.print(f"  {_s(a.get('title') or a.get('app_key') or '')}")
         else:
             _stdout.print("apps: (none installed)")
 
@@ -742,11 +853,11 @@ def render_note_list(result: ArtifactListResponse) -> None:
         # unescaped ``[recipe]`` is itself a Rich tag and silently vanishes,
         # and a label like ``[/dim]`` would close our own markup early.
         labels = "[" + ", ".join(note.labels) + "]"
-        tag = f"  [dim]{escape(labels)}[/dim]" if note.labels else ""
+        tag = f"  [dim]{_s(labels)}[/dim]" if note.labels else ""
         # soft_wrap: same reasoning as render_group_list — don't fold the id.
         _stdout.print(
-            f"{escape(note.name)}{tag}  updated {_format_stamp(note.updated_at)}  "
-            f"[dim]{note.id}[/dim]",
+            f"{_s(note.name)}{tag}  updated {_s(_format_stamp(note.updated_at))}  "
+            f"[dim]{_s(note.id)}[/dim]",
             soft_wrap=True,
         )
     if result.truncated:
@@ -788,29 +899,29 @@ def render_group_messages(page: GroupMessagePage) -> None:
         if m.day_key and m.day_label and m.day_key != last_day_key:
             if last_day_key is not None:
                 _stdout.print()
-            _stdout.print(f"[bold]{m.day_label}[/bold]")
+            _stdout.print(f"[bold]{_s(m.day_label)}[/bold]")
             last_day_key = m.day_key
-        display_name = escape(m.display_name)
+        display_name = _s(m.display_name)
         # "*agent* · for *requester*" — on a deleted
         # post too, as the web's badge is: who wrote it doesn't change.
         agent_tag = ""
         if m.is_agent:
             agent_tag = (
-                f" [dim](agent, for {escape(m.for_display_name)})[/dim]"
+                f" [dim](agent, for {_s(m.for_display_name)})[/dim]"
                 if m.for_display_name
                 else " [dim](agent)[/dim]"
             )
         if m.is_deleted:
             _stdout.print(
-                f"[dim]{m.created_at_display}[/dim] [bold]{display_name}[/bold]{agent_tag}: "
+                f"[dim]{_s(m.created_at_display)}[/dim] [bold]{display_name}[/bold]{agent_tag}: "
                 "[dim](message deleted)[/dim]"
             )
             continue
-        via = f" [dim](via {escape(m.via_display_name)})[/dim]" if m.via_display_name else ""
+        via = f" [dim](via {_s(m.via_display_name)})[/dim]" if m.via_display_name else ""
         via += agent_tag
         edited = " [dim](edited)[/dim]" if m.is_edited else ""
         _stdout.print(
-            f"[dim]{m.created_at_display}[/dim] [bold]{display_name}[/bold]{via}{edited}:"
+            f"[dim]{_s(m.created_at_display)}[/dim] [bold]{display_name}[/bold]{via}{edited}:"
         )
         if m.is_broken:
             _stdout.print("[dim](message could not be rendered)[/dim]")
@@ -822,20 +933,20 @@ def render_group_messages(page: GroupMessagePage) -> None:
             # in a way nothing else printed here is, so it gets its own
             # plain, unparsed print rather than being escaped into a
             # chrome string like the fields above.
-            _stdout.print(m.raw_body, markup=False, highlight=False)
+            _stdout.print(sanitize_text(m.raw_body), markup=False, highlight=False)
         if m.attachments:
             names = ", ".join(
-                escape(str(a.get("filename") or a.get("id") or "attachment")) for a in m.attachments
+                _s(str(a.get("filename") or a.get("id") or "attachment")) for a in m.attachments
             )
             _stdout.print(f"  [dim]📎 {names}[/dim]")
         if m.reactions:
-            chips = " ".join(f"{r.get('emoji', '')}{r.get('count', '')}" for r in m.reactions)
+            chips = " ".join(_s(f"{r.get('emoji', '')}{r.get('count', '')}") for r in m.reactions)
             _stdout.print(f"  {chips}")
     if page.next_before:
         # soft_wrap: the cursor is meant to be copy-pasted into the next
         # --before, and Rich's default wrapping would otherwise fold it
         # across two lines at the terminal width.
-        _stdout.print(f"[dim](more — pass --before {page.next_before})[/dim]", soft_wrap=True)
+        _stdout.print(f"[dim](more — pass --before {_s(page.next_before)})[/dim]", soft_wrap=True)
 
 
 def _format_stamp(iso: str) -> str:
@@ -946,11 +1057,11 @@ def _next_item_line(n: int | None, item: dict[str, Any]) -> str:
         item.get("source_label") or item.get("room"),
         f"room {item['principal']}" if item.get("principal") else None,
     ]
-    meta = f"  [dim]({escape(', '.join(b for b in bits if b))})[/dim]" if any(bits) else ""
+    meta = f"  [dim]({_s(', '.join(b for b in bits if b))})[/dim]" if any(bits) else ""
     head = f"{n:>2}. " if n else "  - "
-    line = f"{head}{escape(item.get('title') or '(untitled)')}{meta}"
+    line = f"{head}{_s(item.get('title') or '(untitled)')}{meta}"
     if item.get("reason"):
-        line += f"\n      [dim]{escape(item['reason'])}[/dim]"
+        line += f"\n      [dim]{_s(item['reason'])}[/dim]"
     return line
 
 
@@ -964,10 +1075,10 @@ def render_next(result: dict[str, Any]) -> None:
     for ev in result["now"]:
         if "countdown" in ev:  # schedule-plan's next_up
             when = f"{ev.get('start_label')}-{ev.get('end_label')}"
-            title, countdown = escape(ev.get("title") or ""), escape(ev["countdown"])
-            out(f"  {title}  [dim]{escape(when)}, {countdown}[/dim]")
+            title, countdown = _s(ev.get("title") or ""), _s(ev["countdown"])
+            out(f"  {title}  [dim]{_s(when)}, {countdown}[/dim]")
             if ev.get("leave"):
-                out(f"  [dim]leave by {escape(str(ev['leave']))}[/dim]")
+                out(f"  [dim]leave by {_s(str(ev['leave']))}[/dim]")
         else:
             out(_calendar_event_line(ev))
     if not result["now"]:
@@ -977,8 +1088,8 @@ def render_next(result: dict[str, Any]) -> None:
     info = result.get("plan")
     if info and info.get("name"):
         mark = ", Pepper's choice today" if info["chosen_by_pepper"] else ""
-        sub = escape(info.get("subtitle") or "")
-        out(f"  [bold]{escape(info['name'])}[/bold]{mark}  [dim]{sub}[/dim]")
+        sub = _s(info.get("subtitle") or "")
+        out(f"  [bold]{_s(info['name'])}[/bold]{mark}  [dim]{sub}[/dim]")
         diff = [o for o in info["others"] if o["differs"]]
         if diff:
             parts = []
@@ -987,11 +1098,11 @@ def render_next(result: dict[str, Any]) -> None:
                 fits = f"fits {n} block{'' if n == 1 else 's'}"
                 head = f"starts with {o['first_block']} and " if o["first_block"] else ""
                 parts.append(f"{o['name']} {head}{fits}")
-            out(f"  [dim]{escape('; '.join(parts))}[/dim]")
+            out(f"  [dim]{_s('; '.join(parts))}[/dim]")
         elif info.get("agree_note"):
-            out(f"  [dim]{escape(info['agree_note'])}[/dim]")
+            out(f"  [dim]{_s(info['agree_note'])}[/dim]")
     if do_next["note"]:
-        out(f"  [dim]{escape(do_next['note'])}[/dim]")
+        out(f"  [dim]{_s(do_next['note'])}[/dim]")
     for n, item in enumerate(do_next["items"], 1):
         out(_next_item_line(n, item))
     if not do_next["items"]:
