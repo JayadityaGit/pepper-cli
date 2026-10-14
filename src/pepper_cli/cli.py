@@ -1987,7 +1987,7 @@ _MAX_COMMUTE_LEGS = 12
 
 def cmd_calendar(args: argparse.Namespace) -> int:
     """``pepper calendar [today|week|schedule] [--start D] [--days N] [--planning] [--json]``."""
-    import datetime
+    import datetime as dt
 
     days = args.days if args.days is not None else (7 if args.window == "week" else 1)
     if not 1 <= days <= 31:
@@ -1995,7 +1995,7 @@ def cmd_calendar(args: argparse.Namespace) -> int:
         return 2
     try:
         if args.start:
-            datetime.date.fromisoformat(args.start)
+            dt.date.fromisoformat(args.start)
     except ValueError:
         render.error("--start must be YYYY-MM-DD")
         return 2
@@ -4826,10 +4826,10 @@ def _parse_due(raw: str, *, flag: str = "--due") -> tuple[str | None, str | None
     Returns ``(iso, None)`` on success or ``(None, error_message)`` so
     the caller can print + exit 2 without raising.
     """
-    import datetime as _dt
+    import datetime as dt
 
     try:
-        parsed = _dt.datetime.fromisoformat(raw)
+        parsed = dt.datetime.fromisoformat(raw)
     except ValueError:
         return None, f"couldn't parse {flag} {raw!r} (try 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM')"
     # Naive input → interpret in local zone (astimezone on a naive dt
