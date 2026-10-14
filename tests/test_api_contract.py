@@ -33,6 +33,11 @@ _MIRROR_RE = re.compile(
     r"#.*?\bMIRROR:\s*(?P<path>[\w/.]+\.py)(?:::(?P<name>\w+)(?P<more>(?:\s*/\s*\w+)*))?"
 )
 
+# Any comment that mentions the marker at all. A comment this matches but ``_MIRROR_RE`` does not
+# (no ``.py`` path, a missing colon) is malformed and fails the suite: it would otherwise be
+# skipped by the scan and never checked.
+_MARKER_RE = re.compile(r"#.*\bMIRROR\b")
+
 # MIRROR comments that do not map a dataclass to a snapshot schema. Keyed by
 # (file under src/pepper_cli/, the ``path[::Name]`` the comment names). Each must really need
 # the exemption: it is an error if the comment would in fact be checked.
@@ -113,6 +118,15 @@ def _annotated_class(tree: ast.Module, lines: list[str], lineno: int) -> str | N
     return None
 
 
+def malformed_markers(lines: list[str]) -> list[int]:
+    """1-based numbers of the lines that mention the marker but do not parse as a MIRROR."""
+    return [
+        i
+        for i, line in enumerate(lines, 1)
+        if _MARKER_RE.search(line) and not _MIRROR_RE.search(line)
+    ]
+
+
 def discover_mirrors() -> list[Mirror]:
     found = []
     for py in sorted(SRC.rglob("*.py")):
@@ -170,6 +184,26 @@ MIRRORS = discover_mirrors()
 def test_mirrors_are_discovered():
     # Guard against the scan silently finding nothing (a moved directory, a changed marker).
     assert len(MIRRORS) >= 20
+
+
+def test_every_marker_parses():
+    problems = [
+        f"{py.relative_to(SRC)}:{n}: mentions MIRROR but is not ``# MIRROR: <path>.py[::Model]``"
+        for py in sorted(SRC.rglob("*.py"))
+        for n in malformed_markers(py.read_text().splitlines())
+    ]
+    assert not problems, "\n".join(problems)
+
+
+def test_malformed_markers_are_reported():
+    lines = [
+        "# MIRROR: src/pepper/api/models.py::Good",
+        "# MIRROR: BareModelName",
+        "# MIRROR src/pepper/api/models.py::NoColon",
+        "x = 1  # mirror: lower case is not the marker",
+        "# Groups (MIRROR: src/pepper/api/groups.py)",
+    ]
+    assert malformed_markers(lines) == [2, 3]
 
 
 def test_snapshot_has_schemas():
