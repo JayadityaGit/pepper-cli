@@ -58,6 +58,21 @@ def test_version_falls_back_when_metadata_is_missing(monkeypatch) -> None:
     assert _version.get_version() == "0+unknown"
 
 
+@pytest.mark.parametrize(
+    "bad",
+    ["1.0\r\nX-Injected: yes", "1.0 beta", "1.0\x1b[2J", "", "1.0\u00e9", "1" * 65, "1.0\n"],
+)
+def test_version_that_is_not_header_safe_falls_back(monkeypatch, bad: str) -> None:
+    monkeypatch.setattr(_version, "version", lambda _name: bad)
+    assert _version.get_version() == "0+unknown"
+
+
+@pytest.mark.parametrize("good", ["0.1.0", "1.2.3rc1", "1!2.0.post1.dev3", "0.1.0+local.build-7"])
+def test_ordinary_versions_pass_through(monkeypatch, good: str) -> None:
+    monkeypatch.setattr(_version, "version", lambda _name: good)
+    assert _version.get_version() == good
+
+
 def test_normal_request_sends_user_agent() -> None:
     seen: list[httpx.Request] = []
     with _api(_recorder(httpx.Response(200, json=_WHOAMI), seen)) as api:
@@ -124,6 +139,89 @@ def test_426_plain_text_body_is_the_message() -> None:
     with _api(lambda _: resp) as api, pytest.raises(api_client.UpgradeRequiredError) as ei:
         api.whoami()
     assert ei.value.message == "Please upgrade to 0.2."
+
+
+def _upgrade_message_for(resp: httpx.Response) -> str:
+    with _api(lambda _: resp) as api, pytest.raises(api_client.UpgradeRequiredError) as ei:
+        api.whoami()
+    return ei.value.message
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        # CSI sequences go whole: no ``[2J`` left behind.
+        ("Upgrade\x1b[2J\x1b[Hnow", "Upgradenow"),
+        ("\x1b[31mUpgrade\x1b[0m now", "Upgrade now"),
+        ("Upgrade\x1b[?25l now", "Upgrade now"),
+        # OSC (window title), ended by BEL or by ST.
+        ("\x1b]0;owned\x07Upgrade now", "Upgrade now"),
+        ("\x1b]0;owned\x1b\\Upgrade now", "Upgrade now"),
+        # An OSC hyperlink keeps its visible text only.
+        ("\x1b]8;;http://example.com\x07Upgrade\x1b]8;;\x07 now", "Upgrade now"),
+        # Other two-byte escapes, and a lone trailing ESC.
+        ("Upgrade\x1bc now", "Upgrade now"),
+        ("Upgrade now\x1b", "Upgrade now"),
+        ("Upgrade now\x1b[", "Upgrade now"),
+        # C1 forms of CSI and OSC, and other C1 controls.
+        ("Upgrade\x9b2J now", "Upgrade now"),
+        ("\x9d0;owned\x9cUpgrade now", "Upgrade now"),
+        ("Upgrade\x85\x90now", "Upgrade now"),
+        # Bare C0 controls and DEL become spaces; runs collapse.
+        ("Upgrade\x07\x08\x00\t\x7f  now", "Upgrade now"),
+        # A carriage return cannot be used to overwrite the start of the line.
+        ("Upgrade now\rAll good", "Upgrade now"),
+        ("\x1b[2J\n\x07\nUpgrade now\nsecond line", "Upgrade now"),
+        # Bidirectional overrides and zero-width characters cannot reorder or
+        # hide the text.
+        ("Upgrade \u202enow\u202c\u200b\u2066\u2069\ufeff", "Upgrade now"),
+    ],
+)
+def test_426_message_has_terminal_controls_removed(body: str, expected: str) -> None:
+    plain = _upgrade_message_for(httpx.Response(426, content=body.encode()))
+    detail = _upgrade_message_for(httpx.Response(426, json={"detail": body}))
+    assert plain == detail == expected
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["\x1b[2J\x1b[H", "\x07\x7f\x9b2J", "\x1b]0;owned\x07", "\r\n\t", "\u202e\u200b"],
+)
+def test_426_body_of_only_controls_uses_the_default_message(body: str) -> None:
+    assert (
+        _upgrade_message_for(httpx.Response(426, content=body.encode()))
+        == api_client.DEFAULT_UPGRADE_MESSAGE
+    )
+    assert (
+        _upgrade_message_for(httpx.Response(426, json={"detail": body}))
+        == api_client.DEFAULT_UPGRADE_MESSAGE
+    )
+
+
+def test_426_message_is_capped_after_cleaning() -> None:
+    # The escape sequences sit inside the first 300 raw characters; the cap
+    # applies to what is left, so the cut never lands inside a sequence.
+    body = "\x1b[31m" * 50 + "x" * 400
+    message = _upgrade_message_for(httpx.Response(426, json={"detail": body}))
+    assert message == "x" * 300
+
+
+def test_cli_prints_no_terminal_controls_from_a_426(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    real_client = httpx.Client
+    resp = httpx.Response(426, content=b"Upgrade\x1b[2J\x1b[H now\x07\r\nmore")
+
+    def make_client(**kwargs):
+        kwargs["transport"] = httpx.MockTransport(lambda _: resp)
+        return real_client(**kwargs)
+
+    monkeypatch.setattr(api_client.httpx, "Client", make_client)
+    rc = cli.main(["login", "--server", "http://example.com", "--token", "pep_pat_abc"])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.err == "Upgrade now\n"
+    assert captured.out == ""
 
 
 @pytest.mark.parametrize(

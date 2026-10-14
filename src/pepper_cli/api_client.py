@@ -2649,15 +2649,55 @@ DEFAULT_UPGRADE_MESSAGE = (
     "This version of pepper is no longer supported. Upgrade with: uv tool upgrade vycari-pepper"
 )
 
-_MAX_UPGRADE_MESSAGE_CHARS = 500
+_MAX_UPGRADE_MESSAGE_CHARS = 300
+
+# Whole terminal escape sequences, removed as units so no parameter bytes
+# (the ``[2J`` of a clear-screen) are left behind as litter. In order: OSC
+# (``ESC ]`` or C1 0x9d, up to BEL / ST), CSI (``ESC [`` or C1 0x9b), then any
+# other two-byte ``ESC x`` escape.
+_ESCAPE_SEQUENCE_RE = _re.compile(
+    r"(?:\x1b\]|\x9d)[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)?"
+    r"|(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]?"
+    r"|\x1b[ -/]*[0-~]?"
+)
+# Every remaining C0 control, DEL and C1 control except newline, which
+# :func:`_sanitize_terminal_line` uses to pick a line. Unicode line and
+# paragraph separators are handled by ``str.splitlines``.
+_CONTROL_CHAR_RE = _re.compile(r"[\x00-\x09\x0b-\x1f\x7f-\x9f]")
+# Invisible format characters that can reorder or hide what is displayed:
+# zero-width characters, bidirectional marks, embeddings, overrides and
+# isolates, and the byte-order mark.
+_INVISIBLE_FORMAT_RE = _re.compile(r"[\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]")
+
+
+def _sanitize_terminal_line(text: str, *, max_chars: int) -> str:
+    """First non-blank line of server-supplied ``text``, safe to print.
+
+    Server text is untrusted for terminal purposes: an escape sequence in it
+    could clear the screen, move the cursor or retitle the window. This drops
+    whole escape sequences and invisible format characters (bidirectional
+    overrides, zero-width characters), turns every other control character
+    into a space, collapses whitespace runs and caps the length. Returns
+    ``""`` when nothing printable is left.
+    """
+    text = _ESCAPE_SEQUENCE_RE.sub("", text)
+    text = _INVISIBLE_FORMAT_RE.sub("", text)
+    text = _CONTROL_CHAR_RE.sub(" ", text.replace("\r\n", "\n").replace("\r", "\n"))
+    for raw_line in text.splitlines():
+        line = " ".join(raw_line.split())
+        if line:
+            return line[:max_chars].rstrip()
+    return ""
 
 
 def _upgrade_message(resp: httpx.Response) -> str:
     """The server's one-line upgrade instruction, or the built-in default.
 
     Takes the JSON ``detail`` string when there is one, else the first line of
-    a plain-text body, else :data:`DEFAULT_UPGRADE_MESSAGE`. Needs a
-    materialized body, like :func:`_extract_detail`.
+    a plain-text body, else :data:`DEFAULT_UPGRADE_MESSAGE`. The text is
+    printed straight to the terminal, so it goes through
+    :func:`_sanitize_terminal_line` first. Needs a materialized body, like
+    :func:`_extract_detail`.
     """
     text = _extract_detail(resp)
     if text is None:
@@ -2666,10 +2706,8 @@ def _upgrade_message(resp: httpx.Response) -> str:
         except ValueError:
             # Not JSON at all: treat the body as the plain-text instruction.
             text = resp.text
-    for line in (text or "").splitlines():
-        if line.strip():
-            return line.strip()[:_MAX_UPGRADE_MESSAGE_CHARS]
-    return DEFAULT_UPGRADE_MESSAGE
+    line = _sanitize_terminal_line(text or "", max_chars=_MAX_UPGRADE_MESSAGE_CHARS)
+    return line or DEFAULT_UPGRADE_MESSAGE
 
 
 def _raise_for_error(resp: httpx.Response) -> NoReturn:
