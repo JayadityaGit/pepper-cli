@@ -38,54 +38,87 @@ _MIRROR_RE = re.compile(
 # skipped by the scan and never checked.
 _MARKER_RE = re.compile(r"#.*\bMIRROR\b")
 
+_JSON = ("application/json",)
+_SSE = ("text/event-stream",)
+
+
+@dataclass(frozen=True)
+class NotCheckable:
+    """Why a MIRROR comment is exempt, and the route that keeps the exemption honest.
+
+    ``route`` is the ``(METHOD, path)`` the comment's dataclass is read from, spelled as the
+    snapshot's ``paths`` key. While the route's 200 response declares no schema under any of
+    ``media``, there is nothing to check the dataclass against. Once the server declares one,
+    ``test_exempt_routes_are_still_untyped`` fails so the exemption is replaced by a real
+    ``::Model`` mapping instead of silently leaving the dataclass unchecked. ``route`` is
+    ``None`` only for a comment that names no model (module prose) or annotates no dataclass
+    (a constant).
+    """
+
+    reason: str
+    route: tuple[str, str] | None = None
+    media: tuple[str, ...] = _JSON
+
+
+_UNTYPED = (
+    "Its response is an untyped dict and the snapshot declares no schema for it (until the "
+    "server declares response models), so there is nothing to resolve."
+)
+
 # MIRROR comments that do not map a dataclass to a snapshot schema. Keyed by
 # (file under src/pepper_cli/, the ``path[::Name]`` the comment names). Each must really need
-# the exemption: it is an error if the comment would in fact be checked.
-NOT_CHECKABLE: dict[tuple[str, str], str] = {
-    ("api_client.py", "src/pepper/api/groups.py"): (
+# the exemption: it is an error if the comment would in fact be checked, or if its route has
+# since gained a response schema.
+NOT_CHECKABLE: dict[tuple[str, str], NotCheckable] = {
+    ("api_client.py", "src/pepper/api/groups.py"): NotCheckable(
         "Prose: a section header and a method-block comment about the whole groups route "
         "module. No model is named, so there is nothing to resolve."
     ),
-    ("api_client.py", "src/pepper/web/auth/device_router.py::device_poll"): (
+    ("api_client.py", "src/pepper/web/auth/device_router.py::device_poll"): NotCheckable(
         "Names a route function, not a model. The poll response is an untyped dict "
         "(pending/denied/approved/...) with no schema in the snapshot, and DevicePoll also "
-        "folds in a client-synthesised 'slow_down' state from an HTTP 429."
+        "folds in a client-synthesised 'slow_down' state from an HTTP 429.",
+        route=("POST", "/auth/device/poll"),
     ),
-    ("api_client.py", "src/pepper/api/groups.py::room_topics"): (
-        "Names a route handler whose response is an untyped dict: the snapshot declares no "
-        "schema for it, so there is nothing to resolve. Covers GroupTopicSummary."
+    ("api_client.py", "src/pepper/api/groups.py::room_topics"): NotCheckable(
+        f"Route handler behind GroupTopicSummary. {_UNTYPED}",
+        route=("GET", "/api/v1/groups/{group_id}/topics"),
     ),
-    ("api_client.py", "src/pepper/api/groups.py::list_groups"): (
-        "Names a route handler whose response is an untyped dict: the snapshot declares no "
-        "schema for it, so there is nothing to resolve. Covers GroupSummary and GroupList."
+    ("api_client.py", "src/pepper/api/groups.py::list_groups"): NotCheckable(
+        f"Route handler behind GroupSummary and GroupList. {_UNTYPED}",
+        route=("GET", "/api/v1/groups"),
     ),
-    ("api_client.py", "src/pepper/api/groups.py::topic_messages"): (
-        "Names a route handler whose response is an untyped dict: the snapshot declares no "
-        "schema for it, so there is nothing to resolve. Covers GroupCard, GroupMessage and "
-        "GroupMessagePage."
+    ("api_client.py", "src/pepper/api/groups.py::topic_messages"): NotCheckable(
+        f"Route handler behind GroupCard, GroupMessage and GroupMessagePage. {_UNTYPED}",
+        route=("GET", "/api/v1/groups/{group_id}/topics/{topic_id}/messages"),
     ),
-    ("api_client.py", "src/pepper/api/groups.py::room_roster"): (
-        "Names a route handler whose response is an untyped dict: the snapshot declares no "
-        "schema for it, so there is nothing to resolve. Covers GroupRosterMember."
+    ("api_client.py", "src/pepper/api/groups.py::room_roster"): NotCheckable(
+        f"Route handler behind GroupRosterMember. {_UNTYPED}",
+        route=("GET", "/api/v1/groups/{group_id}/roster"),
     ),
-    ("api_client.py", "src/pepper/api/groups.py::app_launcher"): (
-        "Names a route handler whose response is an untyped dict: the snapshot declares no "
-        "schema for it, so there is nothing to resolve. Covers GroupAppTile."
+    ("api_client.py", "src/pepper/api/groups.py::app_launcher"): NotCheckable(
+        f"Route handler behind GroupAppTile. {_UNTYPED}",
+        route=("GET", "/api/v1/groups/{group_id}/apps/launcher"),
     ),
-    ("api_client.py", "src/pepper/api/groups.py::agent_events_stream"): (
-        "Names the agent event-feed SSE route (FeedFrame). Stream frames are not described by "
-        "the snapshot, so there is no schema to resolve."
+    ("api_client.py", "src/pepper/api/groups.py::agent_events_stream"): NotCheckable(
+        "Names the agent event-feed SSE route (FeedFrame). The snapshot lists the route with "
+        "an empty response schema and does not describe the stream frames.",
+        route=("GET", "/api/v1/groups/events/stream"),
+        media=_JSON + _SSE,
     ),
-    ("api_client.py", "src/pepper/api/router.py::chat_send"): (
+    ("api_client.py", "src/pepper/api/router.py::chat_send"): NotCheckable(
         "Names the chat route whose SSE path emits StreamEvent frames. The snapshot describes "
         "only the JSON reply (ChatSendResponse, mirrored on ChatReply), not the stream "
-        "frames."
+        "frames, so only the event-stream media type is guarded.",
+        route=("POST", "/api/v1/chat/send"),
+        media=_SSE,
     ),
-    ("api_client.py", "src/pepper/agent/artifacts/applet.py::read_detail"): (
+    ("api_client.py", "src/pepper/agent/artifacts/applet.py::read_detail"): NotCheckable(
         "Names the function behind the artifact detail route (ArtifactDetail), which answers "
-        "an untyped JSONResponse; the snapshot declares no schema for it."
+        f"a bare JSONResponse. {_UNTYPED}",
+        route=("GET", "/api/v1/artifacts/{artifact_id}/detail"),
     ),
-    ("cli.py", "src/pepper/agent/artifacts/service.py::INLINE_TEXT"): (
+    ("cli.py", "src/pepper/agent/artifacts/service.py::INLINE_TEXT"): NotCheckable(
         "Mirrors a string constant (the artifact kind), not a model, and annotates no dataclass."
     ),
 }
@@ -122,8 +155,32 @@ class Mirror:
         return f"{self.file}:{self.line}"
 
 
+def _load_snapshot() -> dict:
+    return json.loads(SNAPSHOT.read_text())
+
+
 def _load_schemas() -> dict[str, dict]:
-    return json.loads(SNAPSHOT.read_text())["components"]["schemas"]
+    return _load_snapshot()["components"]["schemas"]
+
+
+def typed_route_problems(paths: dict[str, dict], exemption: NotCheckable) -> list[str]:
+    """Why ``exemption``'s route no longer justifies it: gone, or now has a response schema.
+
+    An empty schema (``{}``) or a media type the route does not list counts as untyped.
+    """
+    if exemption.route is None:
+        return []
+    method, path = exemption.route
+    operation = paths.get(path, {}).get(method.lower())
+    if operation is None:
+        return [f"{method} {path} is not in the snapshot; fix the route or drop the exemption"]
+    content = operation.get("responses", {}).get("200", {}).get("content", {})
+    return [
+        f"{method} {path} now declares a response schema under {media} ({schema}); replace the "
+        "NOT_CHECKABLE entry with a ``# MIRROR: <path>::<Model>`` mapping to it"
+        for media in exemption.media
+        if (schema := content.get(media, {}).get("schema", {}))
+    ]
 
 
 def resolve_schema(schemas: dict[str, dict], name: str) -> dict | None:
@@ -270,6 +327,51 @@ def test_not_checkable_entries_are_all_used():
     assert not stale, f"NOT_CHECKABLE entries match no MIRROR comment: {stale}"
 
 
+def test_exemptions_on_a_dataclass_name_a_route():
+    # An exemption that leaves a dataclass unchecked must name the route it is read from, so
+    # the route guard below notices when that route gains a response schema. Module prose
+    # (no ``::Name``) names nothing to guard.
+    unguarded = sorted(
+        m.where
+        for m in MIRRORS
+        if (exemption := NOT_CHECKABLE.get((m.file, m.target))) is not None
+        and exemption.route is None
+        and m.name is not None
+        and m.cls is not None
+        and _dataclass_fields(m.file, m.cls) is not None
+    )
+    assert not unguarded, f"NOT_CHECKABLE entries above a dataclass need a route: {unguarded}"
+
+
+@pytest.mark.parametrize("key", sorted(k for k, v in NOT_CHECKABLE.items() if v.route is not None))
+def test_exempt_routes_are_still_untyped(key):
+    problems = typed_route_problems(_load_snapshot()["paths"], NOT_CHECKABLE[key])
+    assert not problems, "\n".join(problems)
+
+
+def _route(method: str, media: str, schema: dict) -> dict:
+    return {method: {"responses": {"200": {"content": {media: {"schema": schema}}}}}}
+
+
+def test_typed_route_problems_reports_a_new_response_model():
+    paths = {
+        "/typed": _route("get", "application/json", {"$ref": "#/components/schemas/Typed"}),
+        "/untyped": _route("get", "application/json", {}),
+        "/stream": _route("post", "text/event-stream", {"$ref": "#/components/schemas/Frame"}),
+    }
+    sse = ("text/event-stream",)
+    assert typed_route_problems(paths, NotCheckable("r", ("GET", "/untyped"))) == []
+    assert typed_route_problems(paths, NotCheckable("r", None)) == []
+    typed = typed_route_problems(paths, NotCheckable("r", ("GET", "/typed")))
+    assert len(typed) == 1
+    assert "GET /typed now declares" in typed[0]
+    # A media type the route does not declare is untyped; the one it does is caught.
+    assert typed_route_problems(paths, NotCheckable("r", ("GET", "/typed"), sse)) == []
+    assert len(typed_route_problems(paths, NotCheckable("r", ("POST", "/stream"), sse))) == 1
+    gone = typed_route_problems(paths, NotCheckable("r", ("GET", "/gone")))
+    assert gone == ["GET /gone is not in the snapshot; fix the route or drop the exemption"]
+
+
 def test_dataclass_fields_exist_in_schema():
     schemas = _load_schemas()
     problems = []
@@ -312,5 +414,6 @@ def test_resolve_schema_handles_qualified_names():
 
 @pytest.mark.parametrize("key", sorted(FIELD_EXCEPTIONS) + sorted(NOT_CHECKABLE))
 def test_allowlist_reasons_are_written(key):
-    reason = {**FIELD_EXCEPTIONS, **NOT_CHECKABLE}[key]
+    reasons = {**FIELD_EXCEPTIONS, **{k: v.reason for k, v in NOT_CHECKABLE.items()}}
+    reason = reasons[key]
     assert len(reason) > 20
