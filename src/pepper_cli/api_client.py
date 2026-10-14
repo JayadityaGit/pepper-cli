@@ -32,6 +32,7 @@ import httpx
 
 from pepper_cli._version import USER_AGENT
 from pepper_cli.secret import SecretStr
+from pepper_cli.terminal_text import CONTROL_CHAR_RE, sanitize_text, strip_sequences
 
 #: Ordinary API request timeout (seconds). Chat streams may have long gaps
 #: between frames while the agent works, so they get a separate read limit.
@@ -59,11 +60,19 @@ class ApiError(Exception):
     surface. Carries the status code and the response body — both
     matter to the CLI: 401 means "log in again", 502 means "server
     hiccup, try again", everything else gets the body printed.
+
+    ``detail`` is server text bound for the terminal (every ``except
+    ApiError`` handler prints it, directly or as ``str(exc)``), so it is
+    cleaned here, once, with :func:`~pepper_cli.terminal_text.sanitize_text`:
+    escape sequences, control characters other than newline and tab, and
+    invisible format characters are gone before any handler sees it.
+    ``body`` stays exactly as received; it is for parsing, never printed.
     """
 
     def __init__(self, status: int, body: str, *, detail: str | None = None) -> None:
         self.status = status
         self.body = body
+        detail = sanitize_text(detail) if detail is not None else None
         self.detail = detail
         msg = f"HTTP {status}"
         if detail:
@@ -2651,24 +2660,6 @@ DEFAULT_UPGRADE_MESSAGE = (
 
 _MAX_UPGRADE_MESSAGE_CHARS = 300
 
-# Whole terminal escape sequences, removed as units so no parameter bytes
-# (the ``[2J`` of a clear-screen) are left behind as litter. In order: OSC
-# (``ESC ]`` or C1 0x9d, up to BEL / ST), CSI (``ESC [`` or C1 0x9b), then any
-# other two-byte ``ESC x`` escape.
-_ESCAPE_SEQUENCE_RE = _re.compile(
-    r"(?:\x1b\]|\x9d)[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)?"
-    r"|(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]?"
-    r"|\x1b[ -/]*[0-~]?"
-)
-# Every remaining C0 control, DEL and C1 control except newline, which
-# :func:`_sanitize_terminal_line` uses to pick a line. Unicode line and
-# paragraph separators are handled by ``str.splitlines``.
-_CONTROL_CHAR_RE = _re.compile(r"[\x00-\x09\x0b-\x1f\x7f-\x9f]")
-# Invisible format characters that can reorder or hide what is displayed:
-# zero-width characters, bidirectional marks, embeddings, overrides and
-# isolates, and the byte-order mark.
-_INVISIBLE_FORMAT_RE = _re.compile(r"[\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]")
-
 
 def _sanitize_terminal_line(text: str, *, max_chars: int) -> str:
     """First non-blank line of server-supplied ``text``, safe to print.
@@ -2680,9 +2671,8 @@ def _sanitize_terminal_line(text: str, *, max_chars: int) -> str:
     into a space, collapses whitespace runs and caps the length. Returns
     ``""`` when nothing printable is left.
     """
-    text = _ESCAPE_SEQUENCE_RE.sub("", text)
-    text = _INVISIBLE_FORMAT_RE.sub("", text)
-    text = _CONTROL_CHAR_RE.sub(" ", text.replace("\r\n", "\n").replace("\r", "\n"))
+    text = strip_sequences(text)
+    text = CONTROL_CHAR_RE.sub(" ", text.replace("\r\n", "\n").replace("\r", "\n"))
     for raw_line in text.splitlines():
         line = " ".join(raw_line.split())
         if line:
