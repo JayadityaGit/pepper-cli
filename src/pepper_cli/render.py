@@ -181,7 +181,7 @@ def write_document(text: str) -> None:
     sys.stdout.write(text if not sys.stdout.isatty() else sanitize_text(text))
 
 
-def info(message: str | Text) -> None:
+def info(message: str | Text, *, soft_wrap: bool = False) -> None:
     """Print a status line to stderr. Used for the chrome around
     commands ('Logged in as ...', 'Removed credentials at ...') so the
     primary output channel stays clean for piping.
@@ -189,11 +189,13 @@ def info(message: str | Text) -> None:
     A ``str`` message is printed literally: it is never parsed as rich
     markup, because callers interpolate server text (an error detail, a
     name) into it. Emphasis comes from passing a :func:`styled` ``Text``.
+    ``soft_wrap=True`` is for a line a person copies back as a command
+    (a next-page hint): rich must not fold it into two lines.
     """
     if isinstance(message, Text):
-        _stderr.print(message)
+        _stderr.print(message, soft_wrap=soft_wrap)
     else:
-        _stderr.print(sanitize_text(message), markup=False)
+        _stderr.print(sanitize_text(message), markup=False, soft_wrap=soft_wrap)
 
 
 def error(message: str, *, soft_wrap: bool = False) -> None:
@@ -668,7 +670,14 @@ def render_scheduled_task(detail: ScheduledTaskDetail) -> None:
     _stdout.print(f"schedule {schedule}")
     stamp = _s(_format_stamp(detail.next_run_at))
     _stdout.print(f"{'next' if detail.active else 'was due'} {stamp}")
-    _stdout.print(f"delivered to {_describe_destinations(detail.destinations)}")
+    if detail.group_name:
+        _stdout.print(f"room {_s(detail.group_name)}")
+    if detail.group_delivery is not None:
+        # A room task's ``None`` destinations is the room's default, which only the
+        # server's own sentence describes ("your default" would be wrong).
+        _stdout.print(f"delivered to {_s(detail.group_delivery)}")
+    else:
+        _stdout.print(f"delivered to {_describe_destinations(detail.destinations)}")
     if detail.latest_run is None:
         _stdout.print("last run (never fired)")
         return
