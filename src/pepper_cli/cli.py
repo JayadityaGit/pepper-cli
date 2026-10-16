@@ -6197,10 +6197,18 @@ def _conflict_fallback_dir() -> str:
     return str(directory)
 
 
+def _conflict_dir_override() -> str | None:
+    """The directory named by ``PEPPER_CONFLICT_DIR``, or ``None`` when it is unset or blank."""
+    value = os.environ.get("PEPPER_CONFLICT_DIR", "").strip()
+    return value or None
+
+
 def _save_conflict_copy(name: str, etag: str | None, text: str) -> tuple[str | None, str | None]:
     """Write ``text`` to ``./<note-slug>.<short-etag>.mine.md``
-    and return ``(path, None)``. ``etag`` is the server's *current* one as of the
-    conflict, not the stale one the CLI sent.
+    (or into ``$PEPPER_CONFLICT_DIR``, created if missing, when that is set;
+    the returned path is then absolute) and return ``(path, None)``. ``etag``
+    is the server's *current* one as of the conflict, not the stale one the
+    CLI sent.
 
     Never overwrites: two attempts against the same server version (a
     retry in this run, or a second ``pepper notes edit`` later) can hold
@@ -6234,11 +6242,19 @@ def _save_conflict_copy(name: str, etag: str | None, text: str) -> tuple[str | N
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
 
     stem = f"{_note_slug(name)}.{(etag or 'unknown')[:8]}.mine"
-    last_error: OSError | None = None
+    last_error: OSError | RuntimeError | None = None
     for fallback in (False, True):
         try:
-            directory = Path(_conflict_fallback_dir()) if fallback else Path()
-        except OSError as exc:
+            if fallback:
+                directory = Path(_conflict_fallback_dir())
+            elif (override := _conflict_dir_override()) is not None:
+                directory = Path(override).expanduser().absolute()
+                directory.mkdir(parents=True, exist_ok=True)
+            else:
+                directory = Path()
+        except (OSError, RuntimeError) as exc:
+            # RuntimeError: ``expanduser`` on a ``~user`` that doesn't
+            # exist. Either way the override is unusable; try the fallback.
             last_error = exc
             continue
         for n in itertools.count():
