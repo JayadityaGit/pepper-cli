@@ -223,6 +223,14 @@ def test_limit_and_group_are_plain_filters(server, capsys) -> None:
     assert [i["ref"] for i in json.loads(out)["items"]] == [POD]
 
 
+def test_group_resolves_against_the_feed_entries_too(server, capsys) -> None:
+    # Sports is only in data.feed: not in counts.by_group, not on a followed item
+    rc, out, _ = _run(capsys, "feed", "--json", "--group", "spo")
+    assert rc == 0 and [i["ref"] for i in json.loads(out)["items"]] == [TEAM]
+    rc, _, err = _run(capsys, "feed", "--json", "--group", "nope")
+    assert rc == 2 and "Reading, Podcasts, Sports" in err
+
+
 def test_no_server_ranking_is_one_line_and_never_a_client_ranking(server, capsys) -> None:
     doc = _doc()
     del doc["data"]["feed"]
@@ -339,6 +347,29 @@ def test_transcript_not_ready_is_labelled_show_notes(server, capsys) -> None:
     assert (
         rc == 0 and "Show notes" in out and "no transcript yet" in out and "Publisher blurb." in out
     )
+
+
+@pytest.mark.parametrize(
+    "body", [{}, {"result": None}, {"result": {}}, {"result": {"kind": "notes"}}]
+)
+def test_an_empty_transcript_answer_says_the_server_returned_none(server, capsys, body) -> None:
+    server.routes["/api/v1/apps/following/actions/episode_transcript"] = httpx.Response(
+        200, json=body
+    )
+    n = _numbers(capsys)["Ep 1"]
+    rc, out, _ = _run(capsys, "feed", str(n), "--transcript")
+    assert rc == 0 and "server returned no transcript" in out and "no transcript yet" not in out
+
+
+def test_an_empty_transcript_answer_keeps_the_servers_kind_and_status(server, capsys) -> None:
+    server.routes["/api/v1/apps/following/actions/episode_transcript"] = httpx.Response(
+        200, json={"result": {"kind": "notes", "status": "pending"}}
+    )
+    n = _numbers(capsys)["Ep 1"]
+    rc, out, _ = _run(capsys, "feed", str(n), "--transcript", "--json")
+    transcript = json.loads(out)["transcript"]
+    assert rc == 0 and transcript["kind"] == "notes" and transcript["status"] == "pending"
+    assert "no transcript" in transcript["error"]
 
 
 def test_transcript_on_a_non_podcast_is_a_line_not_a_failure(server, capsys) -> None:
