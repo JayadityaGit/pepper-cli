@@ -8,6 +8,36 @@ All notable changes to `pepper` (distribution `vycari-pepper`). Newest first. Th
 
 Part of the groups simplification (vycari/groups#249, phase 5).
 
+### Breaking
+
+`pepper next` is rebuilt from the todo list (Vycari/pepper-cli#50). Since pepper#4820 the schedule
+plan's `plans` come back empty, so `next` showed an empty Do next, only email deadlines under Due
+soon, a Later of 0, and ignored `--first`. Scripts that parse `pepper next --json` must be updated.
+
+The CLI makes no decisions here: it fetches and renders. It does no ranking, scoring or filtering by
+urgency, so every client shows the same order. Ordering belongs to the server.
+
+- `--first urgent|important|fast` is removed; argparse rejects it with exit 2. There are no plans to
+  choose between any more.
+- The sections changed: Now, Do next, Due soon and Later are now Now, Today's calendar, and Todos.
+  Todos are listed in the order Pepper returns them: due date soonest first, undated last, then
+  creation order. The top 10 show, and `--all` lists every todo (it used to list every Later item).
+  Each line carries the server's own fields as labels: due date or time (tagged `overdue` once it
+  is behind you, which never moves the todo), priority, and source when it is not `user`.
+  Email-deadline cards from Planning are no longer shown, and todo deadlines and reminders are not
+  turned into calendar rows.
+- `--room` and `--source` narrow the todos only. `--room` now reads that room's own todo list
+  (same server order), and `--source` is a case-insensitive prefix match on the todo's `source`
+  field (`user` or a producer name), not a source label or room name.
+- The `--json` shape is replaced. It was `{generated_at, source, now: [item], plan, do_next,
+  due_soon, later}`. It is now `{generated_at, timezone, source: "todos", note, now,
+  next_event, calendar: [event], todos: {count, items: [todo]}}`, where `timezone` is the account's
+  IANA zone name (null when unreadable) and every time is shown in it. `now` is one event object or null (it was a
+  list), `plan`, `do_next`, `due_soon` and `later` are gone, and `source` is always `"todos"` (it
+  was `"schedule-plan"` or `"fallback"`). Each todo item is `{id, title, due, due_is_date_only,
+  remind_at, priority, source}`, a subset of the server's todo fields with values unchanged
+  (`due` is the server's `due_date`), in the server's order; the README has the details.
+
 ### Changed
 
 - `pepper rooms create` now requires `--name`. Without one (or with a blank one) it fails locally,
