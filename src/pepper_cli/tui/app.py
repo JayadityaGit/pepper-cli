@@ -92,7 +92,18 @@ _LOOPS = ("startup", "rail", "dm", "topic", "publish")
 #: say "retrying"; the roster retries quietly; the turn reports in the status line.
 #: P3 adds one-at-a-time requests started by a key: an older page, a reaction, an edit or
 #: delete (``mutate``), a new topic, the room-info card, and a room's full topic rail.
-_ON_DEMAND = ("send", "roster", "turn", "older", "react", "mutate", "newtopic", "info", "topics")
+_ON_DEMAND = (
+    "send",
+    "roster",
+    "turn",
+    "older",
+    "react",
+    "mutate",
+    "newtopic",
+    "info",
+    "topics",
+    "mentions",
+)
 #: Transport failures that mean a turn's request never reached the server, so it is safe to
 #: give the text back for the user to send again.
 _NOT_SENT = (httpx.ConnectError, httpx.ConnectTimeout)
@@ -151,9 +162,13 @@ class PepperApp(App[None]):
         provider: FilesystemProvider | None = None,
         open_url: Callable[[str], object] = webbrowser.open,
         now: Callable[[], datetime] | None = None,
+        bell: bool = False,
     ) -> None:
         super().__init__()
         self._api = api
+        #: Ring the terminal bell when a mention is first found in another topic (§15 C,
+        #: opt-in only).
+        self._bell = bell
         #: Hands a link to the system browser (``o``); a test passes a recorder.
         self._open_url = open_url
         #: The clock for the "inactive rooms" fold.
@@ -165,6 +180,8 @@ class PepperApp(App[None]):
         self.groups_enabled = True
         self.groups_degraded = False
         self.marks = state.ReadMarks()
+        #: Unread topics that mention you, found one fetch at a time (§15 C).
+        self.mentions = state.Mentions()
         self.current = state.PEPPER
         self.store = state.MessageStore()
         self.dm = state.DmTracker()
@@ -177,7 +194,9 @@ class PepperApp(App[None]):
         self._topics_reading: str | None = None
         #: The message being edited in the composer: ``(conversation, message id)``.
         self.editing: tuple[state.Conversation, str] | None = None
-        self.you_id: str | None = None
+        #: Your groups person id: what ``mentions`` and ``author_person_id`` carry. Not the
+        #: core user id (``whoami().user_id``), which never appears in a group payload.
+        self.you_person_id: str | None = None
         self.hour24 = False
         self.loaded_topic = False
         self.fatal: str | None = None
@@ -446,6 +465,8 @@ class PepperApp(App[None]):
             self._send_next()
         elif kind == "roster":
             self._fetch_roster()
+        elif kind == "mentions":
+            self._check_mentions()
         elif kind == "turn":
             self._start_turn()
         elif kind == "topic" and not self.current.is_pepper:
@@ -475,15 +496,36 @@ class PepperApp(App[None]):
 
     def _load_identity(self) -> tuple[str | None, bool]:
         who = self._api.whoami()
-        return who.user_id, who.time_format == "24h"
+        return who.person_id, who.time_format == "24h"
 
     def _on_identity(self, result: tuple[str | None, bool]) -> None:
-        self.you_id, self.hour24 = result
+        person_id, self.hour24 = result
+        if person_id:
+            self._learn_person_id(person_id)
         self._started = True
         self._run("rail")
         self._run("dm")
 
     # ------------------------------------------------------------------ results
+
+    def _learn_person_id(self, person_id: str) -> None:
+        """Keep your person id for the session; topics asked about before it was known are
+        asked again."""
+        if self.you_person_id is not None:
+            return
+        self.you_person_id = person_id
+        self.mentions.checked.clear()
+        if self._started:
+            self._run("mentions")
+
+    def _learn_from_messages(self, messages: list[GroupMessage]) -> None:
+        """Until whoami carries ``person_id``: your own message names you."""
+        if self.you_person_id is not None:
+            return
+        for m in messages:
+            if m.is_you and m.author_person_id:
+                self._learn_person_id(m.author_person_id)
+                return
 
     def _on_rail(self, update: poller.RailUpdate) -> None:
         self._rail.commit(update)
@@ -499,6 +541,54 @@ class PepperApp(App[None]):
         self.rooms = groups.groups
         self.marks.merge_server(server_marks)
         self.marks.seed_first_sight(self.rooms)
+        # A failing mention loop keeps its backoff: new room activity waits for the retry.
+        mentions = self._loops["mentions"]
+        if mentions.failures == 0:
+            self._run("mentions")
+        elif mentions.timer is None and not mentions.busy:
+            self._schedule("mentions")
+
+    def _check_mentions(self) -> None:
+        """Read the newest page of the next unread topic not yet asked about (one in flight).
+
+        Each delivery asks again, so a burst of unread topics is worked off one request at a
+        time; a topic is asked about once per new activity (``Mentions.due``).
+        """
+        if self.you_person_id is None:
+            return
+        due = self.mentions.due(self.rooms, self.marks, open_topic_id=self.current.topic_id)
+        if not due:
+            return
+        room_id, topic = due[0]
+        conv = state.Conversation(room_id, topic.topic_id)
+        self._start(
+            "mentions",
+            lambda: poller.fetch_topic(self._api, conv, since=None),
+            lambda page: self._mentions_checked(topic, page),
+            on_error=lambda exc: self._mentions_failed(topic, exc),
+        )
+
+    def _mentions_checked(self, topic: GroupTopicSummary, page: GroupMessagePage) -> None:
+        found = self.mentions.record(
+            topic,
+            page.messages,
+            you_id=self.you_person_id,
+            mark=self.marks.marks.get(topic.topic_id),
+        )
+        # A topic opened while this check was in flight has not raised its read mark yet
+        # (its page is still loading), so ``record`` can call it new: no bell for it.
+        if found and self._bell and topic.topic_id != self.current.topic_id:
+            self.bell()
+        self._run("mentions")
+
+    def _mentions_failed(self, topic: GroupTopicSummary, exc: Exception) -> bool:
+        """A topic this token cannot read is dropped; anything else retries with backoff,
+        behind the other due topics so one failing topic does not hold them up."""
+        if isinstance(exc, ApiError) and exc.status in _PUBLISH_PERMANENT:
+            self.mentions.skip(topic)
+            return True
+        self.mentions.defer(topic)
+        return False
 
     def _on_dm(self, history: list[ChatHistoryEntry]) -> None:
         new_ids = self.dm.update(history, is_open=self.current.is_pepper)
@@ -513,6 +603,7 @@ class PepperApp(App[None]):
         self._on_topic(page.messages)
 
     def _on_topic(self, messages: list[GroupMessage]) -> None:
+        self._learn_from_messages(messages)
         new_ids = self.store.add(messages)
         # A send the poll has now returned is the store's row from here on; a selection on
         # its pending row is dropped with it.
@@ -554,7 +645,7 @@ class PepperApp(App[None]):
     def _topic_items(self) -> list[tuple[str | None, Any]]:
         return rows.thread_items(
             self.store.ordered(),
-            you_id=self.you_id,
+            you_id=self.you_person_id,
             pending=self.pending.in_conversation(self.current),
             selected=self.selected,
         )
@@ -581,6 +672,7 @@ class PepperApp(App[None]):
                 pepper_dot=self.dm.dot,
                 folds=self.folds,
                 now=self._now(),
+                mentions=self.mentions,
             ),
             current_key=current_key,
         )
@@ -594,7 +686,8 @@ class PepperApp(App[None]):
         box.set_class(not notice, "empty")
         self._update_subline()
         unread = state.any_unread(shown, self.marks, current=self.current, pepper_dot=self.dm.dot)
-        self.title = ("● " if unread else "") + "Pepper"
+        mention = state.any_mention(shown, self.marks, self.mentions, current=self.current)
+        self.title = ("@ " if mention else "● " if unread else "") + "Pepper"
 
     def _notice(self) -> str:
         if self.fatal:
@@ -1243,6 +1336,7 @@ class PepperApp(App[None]):
         )
 
     def _got_older(self, page: GroupMessagePage) -> None:
+        self._learn_from_messages(page.messages)
         added = self.store.add_older(page.messages, page.next_before)
         self._render_topic(new_rows=0, reset=False, prepended=bool(added))
 
