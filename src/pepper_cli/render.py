@@ -395,7 +395,10 @@ def render_todo_list(rows: list[TodoEntry]) -> None:
     """Pretty-print a todo list to stdout.
 
     One line per todo: status glyph, title, optional localized due date
-    and priority, then a dim id (the handle for ``todos done <id>``).
+    and priority, then a dim id (the handle for ``todos done <id>``). A todo's next
+    action sits on an indented line under it, dim when Pepper wrote it (dim is how every
+    client marks Pepper's own suggestion), and Pepper's pending suggestion over the
+    person's own sits on another dim ``Or:`` line.
     Plain text — no Rich tables — so the output stays grep-able, matching
     ``render_trajectory_list``. Due dates are localized to the machine's
     zone (the CLI runs on the user's own machine).
@@ -413,6 +416,13 @@ def render_todo_list(rows: list[TodoEntry]) -> None:
         line += _ask_suffix(row)
         line += f"  [dim]{_s(row.id)}[/dim]"
         _stdout.print(line)
+        if row.next_action:
+            text = f"Next: {_s(row.next_action.text)}"
+            if row.next_action.by == "model":
+                text = f"[dim]{text}[/dim]"
+            _stdout.print(f"    {text}")
+        if row.next_action_suggestion:
+            _stdout.print(f"    [dim]  Or: {_s(row.next_action_suggestion.text)}[/dim]")
 
 
 #: What a person with no display name on the wire is shown as.
@@ -1214,7 +1224,16 @@ def render_next(result: dict[str, Any]) -> None:
     todos = result["todos"]
     out(f"\n[bold]Todos[/bold] [dim]({todos['count']})[/dim]")
     for n, item in enumerate(todos["items"], 1):
-        line = f"{n:>2}. {_s(item.get('title') or '(untitled)')}"
+        action = item.get("next_action")
+        title = _s(item.get("title") or "(untitled)")
+        # The next action leads; the todo it belongs to follows, dim, so it still reads as
+        # the same row (and the same server order).
+        line = f"{n:>2}. {title}"
+        if action:
+            text = _s(action["text"])
+            if action.get("by") == "model":
+                text = f"[dim]{text}[/dim]"
+            line = f"{n:>2}. {text}  [dim]for: {title}[/dim]"
         labels = [_todo_due_label(item, clock, zone)]
         if item.get("priority"):
             labels.append(f"priority {item['priority']}")
@@ -1224,6 +1243,8 @@ def render_next(result: dict[str, Any]) -> None:
         if labels:
             line += f"  [dim]{_s(', '.join(labels))}[/dim]"
         out(line)
+        if item.get("next_action_suggestion"):
+            out(f"      [dim]Or: {_s(item['next_action_suggestion']['text'])}[/dim]")
     if not todos["items"]:
         out("  [dim](nothing open)[/dim]")
     if todos["count"] > len(todos["items"]):
