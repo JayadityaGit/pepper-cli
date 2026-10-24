@@ -191,6 +191,8 @@ class _Fake:
         self.topics = {_TOPIC: "Dinner", _OTHER_TOPIC: "Chores"}
         self.message_status = 200
         self.fail_messages = 0
+        self.fail_status = 503
+        self.fail_headers: dict[str, str] = {}
         self.exhausted = threading.Event()
         self.on_stream = None
         self.unreachable = False
@@ -243,7 +245,9 @@ class _Fake:
                 raise httpx.ConnectError("refused")
             if self.fail_messages:
                 self.fail_messages -= 1
-                return httpx.Response(503, json={"detail": "down"})
+                return httpx.Response(
+                    self.fail_status, json={"detail": "down"}, headers=self.fail_headers
+                )
             if self.message_status != 200:
                 return httpx.Response(self.message_status, json={"detail": "nope"})
             at = request.url.params.get("at")
@@ -1212,7 +1216,7 @@ def test_messages_post_sends_what_messages_post_sends(monkeypatch):
         "parent_message_id": _MESSAGE,
         "on_behalf_of_person_id": _ALICE,
     }
-    assert post.headers["Idempotency-Key"] == f"claude-channel:{_MESSAGE}"
+    assert post.headers["Idempotency-Key"].startswith(f"claude-channel:{_MESSAGE}:")
 
 
 def test_messages_post_without_a_reply_uses_a_random_key_and_honours_a_given_one(monkeypatch):
@@ -1231,6 +1235,41 @@ def test_messages_post_without_a_reply_uses_a_random_key_and_honours_a_given_one
     keys = [r.headers["Idempotency-Key"] for r in fake.requests if r.method == "POST"]
     assert keys[0] != keys[1]
     assert keys[2] == "mine"
+
+
+def test_two_replies_to_one_parent_get_distinct_default_keys_and_both_post(monkeypatch):
+    fake = _Fake(_CONNECTED)
+
+    def script(s: _Session) -> None:
+        for text in ("first reply", "follow-up the asker requested"):
+            s.call(
+                "messages_post",
+                {"room_id": _ROOM, "topic_id": _TOPIC, "text": text, "reply_to": _MESSAGE},
+            )
+
+    run_channel(monkeypatch, fake, script=script)
+
+    keys = [r.headers["Idempotency-Key"] for r in fake.requests if r.method == "POST"]
+    assert len(keys) == 2
+    assert keys[0] != keys[1]
+    assert all(k.startswith(f"claude-channel:{_MESSAGE}:") for k in keys)
+
+
+def test_a_retried_reply_with_the_same_arguments_reuses_its_default_key(monkeypatch):
+    fake = _Fake(_CONNECTED)
+    reply = {"room_id": _ROOM, "topic_id": _TOPIC, "text": "On it.", "reply_to": _MESSAGE}
+
+    def script(s: _Session) -> None:
+        s.call("messages_post", {**reply, "mentions": [_BOB, _ALICE]})
+        s.call("messages_post", {**reply, "text": "  On it.\n", "mentions": [_ALICE, _BOB]})
+        s.call("messages_post", {**reply, "mentions": [_BOB]})
+        s.call("messages_post", {**reply, "mentions": [_BOB, _ALICE], "on_behalf_of": _ALICE})
+
+    run_channel(monkeypatch, fake, script=script)
+
+    keys = [r.headers["Idempotency-Key"] for r in fake.requests if r.method == "POST"]
+    assert keys[0] == keys[1], "the same post retried carries the same key"
+    assert len(set(keys[1:])) == 3, "a change to what is sent is a different post"
 
 
 def test_messages_post_refuses_a_room_outside_room_and_a_bare_on_behalf_of(monkeypatch):
@@ -1462,6 +1501,52 @@ def test_a_failing_body_fetch_is_retried_and_the_event_is_not_skipped(monkeypatc
     assert result.kinds() == ["message"]
     assert json.loads(cursor_file.read_text())["cursor"] == 7
     assert len([r for r in fake.requests if r.url.path.endswith("/messages")]) == 4
+
+
+def test_a_persistent_5xx_reading_one_message_is_pushed_unavailable_and_the_stream_goes_on(
+    monkeypatch, tmp_path
+):
+    fake = _Fake(_CONNECTED + _scope() + _event(7) + _event(8, message=_MESSAGE_2))
+    fake.fail_messages = claude_channel._FETCH_SERVER_ERROR_ATTEMPTS
+    fake.messages[_MESSAGE_2] = _message_json(_MESSAGE_2)
+    cursor_file = tmp_path / "cursor"
+
+    result = run_channel(monkeypatch, fake, ["--room", _ROOM, "--cursor-file", str(cursor_file)])
+
+    assert result.kinds() == ["message", "message"]
+    first, second = result.notifications
+    assert first["meta"]["body"] == "unavailable"
+    assert first["meta"]["message_id"] == _MESSAGE
+    assert "body" not in second["meta"], "the next message reads normally"
+    assert json.loads(cursor_file.read_text())["cursor"] == 8
+
+
+def test_a_rate_limited_body_fetch_keeps_retrying_on_retry_after_and_is_never_unavailable(
+    monkeypatch, tmp_path
+):
+    waits: list[float] = []
+
+    def wait(self, seconds: float) -> None:
+        waits.append(seconds)
+        if self.stop.wait(0.001):
+            raise claude_channel._Ended(0)
+
+    monkeypatch.setattr(claude_channel.ChannelWorker, "_wait", wait)
+    fake = _Fake(_CONNECTED + _scope() + _event(7))
+    fake.fail_messages = claude_channel._FETCH_SERVER_ERROR_ATTEMPTS * 2
+    fake.fail_status = 429
+    fake.fail_headers = {"Retry-After": "7"}
+    cursor_file = tmp_path / "cursor"
+
+    result = run_channel(monkeypatch, fake, ["--room", _ROOM, "--cursor-file", str(cursor_file)])
+
+    assert result.kinds() == ["message"]
+    (pushed,) = result.notifications
+    assert "body" not in pushed["meta"], "a throttled read is retried, not given up on"
+    assert json.loads(cursor_file.read_text())["cursor"] == 7
+    fetch_waits = waits[: claude_channel._FETCH_SERVER_ERROR_ATTEMPTS * 2]
+    assert fetch_waits == [7.0] * len(fetch_waits), "Retry-After replaces the backoff gap"
+    assert len([r for r in fake.requests if r.url.path.endswith("/messages")]) == 11
 
 
 def test_a_body_fetch_that_cannot_succeed_ends_the_channel(monkeypatch):

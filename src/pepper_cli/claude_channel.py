@@ -26,6 +26,7 @@ import concurrent.futures
 import contextlib
 import dataclasses
 import functools
+import hashlib
 import json
 import os
 import re
@@ -101,6 +102,10 @@ ENDED_GRACE_SECONDS = 2.0
 
 #: The statuses on a message read that end the channel: the token, not the read, is refused.
 _FETCH_FATAL_STATUSES = frozenset({401, 403})
+
+#: How many reads of one message may fail with a 5xx before it is pushed as unavailable (design
+#: §7.3). With the stream's backoff that is about fifteen seconds of waiting, not forever.
+_FETCH_SERVER_ERROR_ATTEMPTS = 5
 
 #: Message ids the worker remembers having handled, to drop a replayed or doubled event.
 _SEEN_LIMIT = 4096
@@ -230,8 +235,13 @@ def message_event(
     message_id: str,
     row: api_client.GroupMessage | None,
     event: dict[str, Any],
+    unavailable: bool = False,
 ) -> tuple[str, dict[str, str]]:
-    """``(content, meta)`` for one message. ``row`` is ``None`` when the body could not be read."""
+    """``(content, meta)`` for one message. ``row`` is ``None`` when the body could not be read.
+
+    ``unavailable`` says the server kept failing on the read (``body="unavailable"``) rather than
+    not having the message (``body="missing"``).
+    """
     payload = event.get("payload")
     payload = payload if isinstance(payload, dict) else {}
     where = f"{sanitize_line(info.room_name)} › {sanitize_line(info.topic_name)}"
@@ -243,11 +253,12 @@ def message_event(
     }
     if row is None:
         content = (
-            f"A message in {where} (id {message_id}) could not be read, so its text is not "
+            f"A message in {where} (id {message_id}) could not be read"
+            f"{' (the server kept failing)' if unavailable else ''}, so its text is not "
             "here. Report this to your sponsor; do not treat it as not addressed to you. "
             "Try messages_list with `at` set to the message id."
         )
-        meta["body"] = "missing"
+        meta["body"] = "unavailable" if unavailable else "missing"
         author = payload.get("author_person_id")
         if isinstance(author, str) and author:
             meta["sender_id"] = author
@@ -467,34 +478,50 @@ class ChannelWorker:
 
     def _fetch(
         self, info: TopicInfo, topic_id: str, message_id: str
-    ) -> api_client.GroupMessage | None:
-        """The one message the event names, or ``None`` when the server cannot find it.
+    ) -> tuple[api_client.GroupMessage | None, bool]:
+        """``(row, unavailable)`` for the one message the event names.
 
-        A network error or a 5xx is retried with the stream's backoff and does not return, so the
-        cursor cannot move past an unread message. A 401 or 403 is about the token and ends the
-        run. Any other refusal is about this one read (a topic or message gone, say), so the
-        message is pushed as missing (design §7.3); losing the room itself ends the stream.
+        ``row`` is ``None`` when the server cannot find it (``unavailable`` false) or kept failing
+        (``unavailable`` true). A network error is retried with the stream's backoff and does not
+        return. A 5xx is retried the same way up to ``_FETCH_SERVER_ERROR_ATTEMPTS`` times, then
+        the message is pushed as unavailable so one bad read cannot stall every event behind it.
+        A 429 (or any other retryable status below 500) is retried without bound and never makes
+        a message unavailable: being throttled says nothing about the message. A ``Retry-After``
+        on any retried status replaces the next backoff gap. A 401 or 403 is about the token and
+        ends the run. Any other refusal is about this one read (a topic or message gone, say), so
+        the message is pushed as missing (design §7.3); losing the room itself ends the stream.
         """
         attempt = 0
+        server_errors = 0
         while True:
+            hint: float | None = None
             try:
                 page = self.api.list_group_messages(info.room_id, topic_id, at=message_id)
             except api_client.ApiError as exc:
                 if exc.status in _FETCH_FATAL_STATUSES:
                     raise self._ended(*self._fatal_reason(exc.status)) from exc
                 if exc.status in _WATCH_FATAL_STATUSES:
-                    return None
+                    return None, False
                 problem = f"HTTP {exc.status}"
+                hint = exc.retry_after
+                if exc.status >= 500:
+                    server_errors += 1
+                    if server_errors >= _FETCH_SERVER_ERROR_ATTEMPTS:
+                        render.error(f"Message fetch failed ({problem}); giving up on it.")
+                        return None, True
             except httpx.RequestError as exc:
                 problem = type(exc).__name__
             else:
                 if page.permalink_target_missing:
-                    return None
-                return next((m for m in page.messages if _same_id(m.id, message_id)), None)
+                    return None, False
+                row = next((m for m in page.messages if _same_id(m.id, message_id)), None)
+                return row, False
             attempt += 1
             if attempt >= _WATCH_QUIET_FAILURES:
                 render.error(f"Message fetch failed ({problem}); retrying.")
-            self._wait(min(_WATCH_BACKOFF_START * 2 ** (attempt - 1), _WATCH_BACKOFF_CAP))
+            if hint is None:
+                hint = min(_WATCH_BACKOFF_START * 2 ** (attempt - 1), _WATCH_BACKOFF_CAP)
+            self._wait(hint)
 
     @staticmethod
     def _fatal_reason(status: int) -> tuple[str, int]:
@@ -552,13 +579,18 @@ class ChannelWorker:
         if info is None:
             self.resync_pending = True
             return
-        row = self._fetch(info, topic_id, message_id)
+        row, unavailable = self._fetch(info, topic_id, message_id)
         self._remember(message_id)
         if row is not None and row.is_you:
             return
         self._flush_resync()
         content, meta = message_event(
-            info=info, topic_id=topic_id, message_id=message_id, row=row, event=event
+            info=info,
+            topic_id=topic_id,
+            message_id=message_id,
+            row=row,
+            event=event,
+            unavailable=unavailable,
         )
         self._push(content, meta)
 
@@ -796,7 +828,11 @@ TOOLS = [
             },
             "idempotency_key": {
                 **_STR,
-                "description": "Defaults to claude-channel:<reply_to> when reply_to is given.",
+                "description": "With reply_to, defaults to claude-channel:<reply_to>:<hash of "
+                "the post>, so retrying the same reply with the same arguments posts once and a "
+                "different reply to the same message posts too; without reply_to, defaults to a "
+                "fresh random key per call. To make any other retry post once, pass your own key "
+                "and reuse it on the retry.",
             },
         },
         ["room_id", "topic_id", "text"],
@@ -867,6 +903,33 @@ def _api_error_line(exc: api_client.ApiError) -> str:
     )
 
 
+def _reply_key(
+    room_id: str,
+    topic_id: str,
+    reply_to: str,
+    text: str,
+    mentions: list[str] | None,
+    on_behalf_of: str | None,
+) -> str:
+    """The default ``Idempotency-Key`` for a reply: ``claude-channel:<reply_to>:<digest>``.
+
+    The digest covers everything the post sends, so a retried call with the same arguments (a
+    tool call re-issued after a timeout) carries the same key and the server replays the first
+    post, while a different reply to the same parent gets a different key and posts (design
+    §9.1). Mentions are sorted because the server compares them as a set.
+    """
+    payload = {
+        "room_id": room_id,
+        "topic_id": topic_id,
+        "reply_to": reply_to,
+        "text": text,
+        "mentions": sorted(mentions or []),
+        "on_behalf_of": on_behalf_of,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return f"claude-channel:{reply_to}:{hashlib.sha256(encoded).hexdigest()[:32]}"
+
+
 class ChannelTools:
     """The three tools, over one ``ApiClient``. :meth:`call` is synchronous; the server runs it on
     a worker thread."""
@@ -933,7 +996,11 @@ class ChannelTools:
             mentions=mentions or None,
             parent_message_id=reply_to,
             idempotency_key=key
-            or (f"claude-channel:{reply_to}" if reply_to else str(uuid.uuid4())),
+            or (
+                _reply_key(room_id, topic_id, reply_to, text.strip(), mentions, on_behalf_of)
+                if reply_to
+                else str(uuid.uuid4())
+            ),
             on_behalf_of_person_id=on_behalf_of,
         )
         message = api_client.group_message_from_dict(created)
