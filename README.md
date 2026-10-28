@@ -12,6 +12,8 @@ the Pepper server package).
 The package is published as `vycari-pepper`; the command it installs is `pepper`.
 It is licensed under Apache-2.0 (see `LICENSE`).
 
+Codebase documentation: [Explore the codebase on DeepWiki](https://deepwiki.com/Vycari/pepper-cli).
+
 > [!NOTE]
 > The `/api/v1` API this client talks to is supported for Vycari's own clients.
 > Third-party clients that use a PAT against it do so at their own risk: there is
