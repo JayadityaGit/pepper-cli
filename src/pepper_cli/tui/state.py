@@ -913,8 +913,9 @@ class DmTurn:
 
     ``snapshot`` holds the history ids on screen when the turn started. A reply frame names
     its rows (``user_message_id``/``assistant_message_id``); a dropped stream does not, and
-    then the reply is "an assistant row that was not in the snapshot". The turn is never
-    sent twice: a drop only ever re-reads history.
+    then the turn finds its own user row (the first new user row with the text it sent) and its
+    reply is the first assistant row created after that row in the same trajectory. The turn
+    is never sent twice: a drop only ever re-reads history.
 
     Only a ``streaming`` or ``checking`` turn holds back the next one. A ``done`` turn stays
     just to show its rows until history does, and is retired after
@@ -951,28 +952,54 @@ class DmTurn:
             return self.user_id in entries
         if self.phase == "queued":
             return False
+        if self.phase == "checking":
+            return self._own_user_row(entries) is not None
         return any(e.role == "user" and eid not in self.snapshot for eid, e in entries.items())
+
+    def _own_user_row(self, entries: dict[str, ChatHistoryEntry]) -> ChatHistoryEntry | None:
+        """After a dropped stream, this turn's own user row: the earliest user row not in the
+        snapshot whose text is what was sent. ``None`` when history shows no such row."""
+        sent = self.text.strip()
+        mine = [
+            (_ts_or_epoch(e.created_at), eid, e)
+            for eid, e in entries.items()
+            if e.role == "user" and eid not in self.snapshot and e.text.strip() == sent
+        ]
+        return min(mine, key=lambda row: row[:2])[2] if mine else None
 
     def reply_landed(self, entries: dict[str, ChatHistoryEntry]) -> bool:
         if self.assistant_id is not None:
             return self.assistant_id in entries
         if self.phase != "checking":
             return False
-        return any(e.role == "assistant" and eid not in self.snapshot for eid, e in entries.items())
+        return self.reply_id(entries) is not None
 
     def reply_id(self, entries: dict[str, ChatHistoryEntry]) -> str | None:
         """The id of this turn's assistant row: the one the reply frame named, or after a
-        dropped stream the first assistant row not in the snapshot."""
+        dropped stream the first assistant row (not in the snapshot) created after the turn's
+        own user row and carrying the same ``trajectory_id``.
+
+        The server writes a turn's reply and links its user row to the turn in one
+        transaction, so once the user row is linked only that turn's reply matches. Earlier
+        assistant rows are always excluded, but a row with no trajectory (a reminder, a
+        scheduled announcement) created after a user row that is not linked yet (its reply
+        not written, the error path, or a server that does not send the field) can still
+        match. With no identifiable user row there is no guess."""
         if self.assistant_id is not None or self.phase != "checking":
             return self.assistant_id
-        return next(
-            (
-                eid
-                for eid, e in entries.items()
-                if e.role == "assistant" and eid not in self.snapshot
-            ),
-            None,
-        )
+        user = self._own_user_row(entries)
+        if user is None:
+            return None
+        sent_at = _ts_or_epoch(user.created_at)
+        later = [
+            (_ts_or_epoch(e.created_at), eid)
+            for eid, e in entries.items()
+            if e.role == "assistant"
+            and eid not in self.snapshot
+            and e.trajectory_id == user.trajectory_id
+            and _ts_or_epoch(e.created_at) > sent_at
+        ]
+        return min(later)[1] if later else None
 
     def found_reply(self, entries: dict[str, ChatHistoryEntry]) -> str | None:
         """The text of the assistant row history shows for this turn, once :meth:`reply_landed`."""

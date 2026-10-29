@@ -411,15 +411,25 @@ def test_pending_sends_retry_keeps_the_key_and_confirm_drops_stored_rows() -> No
     assert sends.in_conversation(other)[0].body == "two"
 
 
-def _entry(eid: str, role: str) -> api_client.ChatHistoryEntry:
+def _entry(
+    eid: str,
+    role: str,
+    text: str = "t",
+    at: str = "2026-09-16T09:00:00Z",
+    tid: str | None = None,
+) -> api_client.ChatHistoryEntry:
     return api_client.ChatHistoryEntry(
-        id=eid, role=role, text="t", channel="terminal", created_at="2026-09-16T09:00:00Z"
+        id=eid, role=role, text=text, channel="terminal", created_at=at, trajectory_id=tid
     )
 
 
 def test_dm_turn_lands_by_id_or_by_snapshot_only_while_checking() -> None:
     before = {"h1": _entry("h1", "user"), "h2": _entry("h2", "assistant")}
-    after = {**before, "u1": _entry("u1", "user"), "a1": _entry("a1", "assistant")}
+    after = {
+        **before,
+        "u1": _entry("u1", "user", "q", "2026-09-16T10:00:00Z"),
+        "a1": _entry("a1", "assistant", "t", "2026-09-16T10:00:05Z"),
+    }
     turn = state.DmTurn(text="q", snapshot=frozenset(before))
     assert not turn.user_landed(after)  # queued: never sent, so never in history
     turn.phase = "streaming"
@@ -509,3 +519,69 @@ def test_sidebar_rows_carry_the_mention_on_topic_and_collapsed_room() -> None:
         )
         if r.unread and r.kind == "topic"
     } == {"topic:t1", "topic:t2"}
+
+
+def test_a_dropped_turn_does_not_take_an_unrelated_assistant_row_as_its_reply() -> None:
+    before = {"h1": _entry("h1", "assistant", "old", "2026-09-16T09:00:00Z")}
+    turn = state.DmTurn(text="q", phase="checking", snapshot=frozenset(before))
+    # A reply to another device's message lands first; the turn's own user row is not in yet.
+    stray = {**before, "x1": _entry("x1", "assistant", "proactive", "2026-09-16T10:00:00Z")}
+    assert turn.reply_id(stray) is None and not turn.reply_landed(stray)
+    assert turn.found_reply(stray) is None
+    # The user row arrives later than the stray row: the stray row precedes it, so still no match.
+    both = {**stray, "u1": _entry("u1", "user", "q", "2026-09-16T10:01:00Z")}
+    assert turn.reply_id(both) is None
+    # The real reply follows the user row.
+    done = {**both, "a1": _entry("a1", "assistant", "the answer", "2026-09-16T10:01:05Z")}
+    assert turn.reply_id(done) == "a1" and turn.found_reply(done) == "the answer"
+
+
+def test_a_dropped_turn_with_an_unidentifiable_user_row_does_not_guess() -> None:
+    turn = state.DmTurn(text="q", phase="checking")
+    # An assistant row, and a user row whose text is not what was sent (another device's).
+    entries = {
+        "u1": _entry("u1", "user", "something else", "2026-09-16T10:00:00Z"),
+        "a1": _entry("a1", "assistant", "reply", "2026-09-16T10:00:05Z"),
+    }
+    assert turn.reply_id(entries) is None and not turn.reply_landed(entries)
+    # A user row already in the snapshot is not this turn's either.
+    old = {"u0": _entry("u0", "user", "q", "2026-09-16T09:00:00Z"), **entries}
+    seen = state.DmTurn(text="q", phase="checking", snapshot=frozenset({"u0"}))
+    assert seen.reply_id(old) is None
+
+
+def test_a_dropped_turn_takes_only_the_reply_in_its_user_rows_trajectory() -> None:
+    before = {"h1": _entry("h1", "assistant", "old", "2026-09-16T09:00:00Z")}
+    turn = state.DmTurn(text="q", phase="checking", snapshot=frozenset(before))
+    entries = {
+        **before,
+        "u1": _entry("u1", "user", "q", "2026-09-16T10:01:00Z", tid="T1"),
+        # A reminder (no trajectory) and a reply to another device (its own) land in between.
+        "p1": _entry("p1", "assistant", "Reminder: standup", "2026-09-16T10:01:02Z"),
+        "o1": _entry("o1", "assistant", "other device", "2026-09-16T10:01:03Z", tid="T2"),
+    }
+    assert turn.reply_id(entries) is None and not turn.reply_landed(entries)
+    done = {**entries, "a1": _entry("a1", "assistant", "the answer", "2026-09-16T10:01:05Z", "T1")}
+    assert turn.reply_id(done) == "a1" and turn.found_reply(done) == "the answer"
+
+
+def test_a_dropped_turn_with_an_unlinked_user_row_skips_another_turns_reply() -> None:
+    turn = state.DmTurn(text="q", phase="checking")
+    # The user row is not linked yet; a later row carrying a trajectory belongs to another turn.
+    entries = {
+        "u1": _entry("u1", "user", "q", "2026-09-16T10:01:00Z"),
+        "o1": _entry("o1", "assistant", "other device", "2026-09-16T10:01:03Z", tid="T2"),
+    }
+    assert turn.reply_id(entries) is None
+    # The error path: neither row has a trajectory, and the reply still matches.
+    failed = {**entries, "a1": _entry("a1", "assistant", "sorry", "2026-09-16T10:01:04Z")}
+    assert turn.reply_id(failed) == "a1"
+
+
+def test_a_dropped_turn_shows_its_bubble_until_its_own_user_row_lands() -> None:
+    before = {"h1": _entry("h1", "assistant", "old", "2026-09-16T09:00:00Z")}
+    turn = state.DmTurn(text="q", phase="checking", snapshot=frozenset(before))
+    other = {**before, "u9": _entry("u9", "user", "lunch?", "2026-09-16T10:01:00Z")}
+    assert not turn.user_landed(other)  # another device's row is not this turn's
+    mine = {**other, "u1": _entry("u1", "user", "q", "2026-09-16T10:01:01Z")}
+    assert turn.user_landed(mine)
