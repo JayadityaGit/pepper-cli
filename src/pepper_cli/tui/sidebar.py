@@ -14,6 +14,8 @@ from pepper_cli.tui.rows import safe_color
 from pepper_cli.tui.state import SidebarRow
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from textual.widgets.tree import TreeNode
 
 DOT = "●"
@@ -27,9 +29,11 @@ def row_label(row: SidebarRow, *, current: bool) -> Text:
     if row.kind == "room":
         label.append("■ ", style=safe_color(row.color) or "")
     name = sanitize_line(row.label)
-    if row.kind == "app":
-        label.append("▌ ", style="bold")  # the open room app: its row exists only while open
-    if row.kind in ("more", "archived", "newtopic", "inactive"):
+    if row.kind == "app" or (row.kind == "own_app" and current):
+        label.append("▌ ", style="bold")  # an open app: a room's row exists only while open
+    if row.kind == "rule":
+        label.append(name, style="dim")
+    elif row.kind in ("more", "archived", "newtopic", "inactive"):
         label.append(name, style="dim italic")
     else:
         label.append(name, style="bold reverse" if current else "bold" if row.unread else "")
@@ -66,6 +70,11 @@ class Sidebar(Tree[SidebarRow]):
         #: A row the app asked for by key; a redraw still waiting to restore the old cursor
         #: yields to it.
         self._wanted: str | None = None
+        #: False until a redraw has placed the cursor: before that the tree's default cursor
+        #: (the first row) is not a choice worth keeping across a second early redraw.
+        self._placed = False
+        #: Bumped by every redraw, so a restore queued for a redraw since replaced does nothing.
+        self._generation = 0
 
     @property
     def highlighted_row(self) -> SidebarRow | None:
@@ -78,7 +87,8 @@ class Sidebar(Tree[SidebarRow]):
         if signature == self._signature:
             return
         self._signature = signature
-        keep = self.highlighted_row.key if self.highlighted_row else None
+        row = self.highlighted_row if self._placed else None
+        keep = row.key if row is not None else None
         self.clear()
         self.root.expand()
         self._by_key = {}
@@ -88,20 +98,27 @@ class Sidebar(Tree[SidebarRow]):
             if row.kind == "room":
                 node = self.root.add(label, data=row, expand=row.expanded)
                 parent = node
-            elif row.kind in ("pepper", "inactive"):
+            elif row.kind in ("pepper", "inactive", "own_app", "rule"):
                 node = self.root.add_leaf(label, data=row)
             else:
                 node = parent.add_leaf(label, data=row)
             self._by_key[row.key] = node
-        self.call_after_refresh(self._restore_cursor, keep)
+        self._generation += 1
+        self.call_after_refresh(self._restore_cursor, self._generation, keep, current_key)
 
-    def _restore_cursor(self, key: str | None) -> None:
+    def _restore_cursor(self, generation: int, key: str | None, current_key: str | None) -> None:
+        if generation != self._generation:
+            return  # (a later redraw replaced these nodes; its own restore places the cursor)
         key = self._wanted or key
         node = self._by_key.get(key) if key else None
+        if node is None and current_key is not None:
+            node = self._by_key.get(current_key)  # (first draw: rest on the open conversation)
         if node is None:
             node = next(iter(self._by_key.values()), None)
         if node is not None:
+            _ = self.last_line  # (builds the tree's lines, so the node's line is this tree's)
             self.move_cursor(node)
+            self._placed = True
 
     def select_key(self, key: str) -> None:
         """Move the cursor to a row by key (used by next-unread)."""
@@ -112,6 +129,20 @@ class Sidebar(Tree[SidebarRow]):
 
     def _forget_wanted(self) -> None:
         self._wanted = None
+
+    def action_cursor_up(self) -> None:
+        super().action_cursor_up()
+        self._step_over_rule(super().action_cursor_up)
+
+    def action_cursor_down(self) -> None:
+        super().action_cursor_down()
+        self._step_over_rule(super().action_cursor_down)
+
+    def _step_over_rule(self, step: Callable[[], None]) -> None:
+        """The line under Todos and Notes is a divider, not a place to rest the cursor."""
+        row = self.highlighted_row
+        if row is not None and row.kind == "rule":
+            step()
 
     def action_expand_room(self) -> None:
         row = self.highlighted_row

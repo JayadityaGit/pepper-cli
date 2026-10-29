@@ -31,6 +31,7 @@ if TYPE_CHECKING:
         GroupSummary,
         GroupTopicSummary,
         GroupUnreadRow,
+        RoomTodos,
         TodoEntry,
     )
 
@@ -258,10 +259,13 @@ class SidebarRow:
     """One line of the Messages tree. ``key`` is stable across rebuilds."""
 
     key: str
-    #: "pepper" | "room" | "topic" | "more" | "archived" | "newtopic" | "inactive" | "app"
+    #: "pepper" | "room" | "topic" | "more" | "archived" | "newtopic" | "inactive" | "app" (a
+    #: room's open app) | "own_app" (your own Todos or Notes) | "rule" (the line under them)
     kind: str
     label: str
     depth: int
+    #: ``todo`` or ``notes`` on an ``own_app`` row.
+    slug: str | None = None
     room_id: str | None = None
     topic_id: str | None = None
     color: str | None = None
@@ -329,7 +333,10 @@ def build_sidebar(
     now: datetime | None = None,
     pane: AppPaneState | None = None,
 ) -> list[SidebarRow]:
-    """The Messages tree as flat rows: Pepper first, then rooms in server (recency) order.
+    """The Messages tree as flat rows: your own Todos and Notes, a rule, Pepper, then rooms in
+    server (recency) order.
+
+    The two top-level app rows are always there (they need no rooms) and carry no unread dot.
 
     A room is expanded when the user said so by hand (``manual``), else when it is the open
     room. An expanded room lists its 5 most recent topics plus a "Show more (N)" row (the
@@ -338,7 +345,9 @@ def build_sidebar(
     (never the open room, nor one with something unread); without it nothing folds.
     """
     folds = folds or SidebarFolds()
-    rows = [SidebarRow(key="pepper", kind="pepper", label="Pepper", depth=0, unread=pepper_dot)]
+    rows = [own_app_row(slug) for slug in APP_TITLES]
+    rows.append(SidebarRow(key="rule", kind="rule", label=RULE, depth=0))
+    rows.append(SidebarRow(key="pepper", kind="pepper", label="Pepper", depth=0, unread=pepper_dot))
     folded: set[str] = set()
     if now is not None:
         folded = {
@@ -684,25 +693,52 @@ class DmTracker:
 
     entries: dict[str, ChatHistoryEntry] = field(default_factory=dict)
     dot: bool = False
+    #: The assistant rows behind the dot, so showing one elsewhere puts out only its share.
+    unseen: set[str] = field(default_factory=set)
     _primed: bool = False
 
-    def update(self, history: Iterable[ChatHistoryEntry], *, is_open: bool) -> list[str]:
+    def update(
+        self,
+        history: Iterable[ChatHistoryEntry],
+        *,
+        is_open: bool,
+        seen: AbstractSet[str] = frozenset(),
+    ) -> list[str]:
         """Replace the rows with a history read. Returns the ids not in the previous read.
 
         The read is the whole of today's thread, so it replaces what was held rather than
         merging into it: after midnight, yesterday's rows drop out instead of staying under
-        the "Today" heading.
+        the "Today" heading. An assistant row in ``seen`` was already shown elsewhere (the
+        reply strip under your own pane) and does not light the dot.
         """
         previous = self.entries
         self.entries = {entry.id: entry for entry in history}
         new_ids = [eid for eid in self.entries if eid not in previous]
-        fresh_assistant = any(self.entries[eid].role == "assistant" for eid in new_ids)
+        fresh = {
+            eid for eid in new_ids if self.entries[eid].role == "assistant" and eid not in seen
+        }
         if is_open:
-            self.dot = False
-        elif self._primed and fresh_assistant:
+            self.read()
+        elif self._primed and fresh:
+            self.unseen |= fresh
             self.dot = True
         self._primed = True
         return new_ids
+
+    def read(self) -> None:
+        """The DM is on screen: nothing in it is unread."""
+        self.dot = False
+        self.unseen.clear()
+
+    def mark_seen(self, eid: str) -> bool:
+        """``eid`` was shown elsewhere (the reply strip). Returns whether the dot went out."""
+        if eid not in self.unseen:
+            return False
+        self.unseen.discard(eid)
+        if self.unseen:
+            return False
+        self.dot = False
+        return True
 
     def ordered(self) -> list[ChatHistoryEntry]:
         return sorted(self.entries.values(), key=lambda e: (_ts_or_epoch(e.created_at), e.id))
@@ -886,6 +922,10 @@ class DmTurn:
     """
 
     text: str
+    #: Sent from one of your own panes: the app on screen (``app:todo``) and, over a note,
+    #: ``{"note_id": ...}``. Both ride on the request (``ChatSendRequest``).
+    subject: str | None = None
+    context: dict[str, Any] | None = None
     snapshot: frozenset[str] = frozenset()
     phase: TurnPhase = "queued"
     status: str = ""
@@ -919,6 +959,25 @@ class DmTurn:
         if self.phase != "checking":
             return False
         return any(e.role == "assistant" and eid not in self.snapshot for eid, e in entries.items())
+
+    def reply_id(self, entries: dict[str, ChatHistoryEntry]) -> str | None:
+        """The id of this turn's assistant row: the one the reply frame named, or after a
+        dropped stream the first assistant row not in the snapshot."""
+        if self.assistant_id is not None or self.phase != "checking":
+            return self.assistant_id
+        return next(
+            (
+                eid
+                for eid, e in entries.items()
+                if e.role == "assistant" and eid not in self.snapshot
+            ),
+            None,
+        )
+
+    def found_reply(self, entries: dict[str, ChatHistoryEntry]) -> str | None:
+        """The text of the assistant row history shows for this turn, once :meth:`reply_landed`."""
+        found = entries.get(reply_id) if (reply_id := self.reply_id(entries)) else None
+        return found.text if found is not None else None
 
     def gave_up(self, now: float) -> bool:
         """A dropped turn whose reply, or an answered turn whose rows, did not show within
@@ -1009,16 +1068,26 @@ def url_domain(url: str) -> str:
 
 
 @dataclass(frozen=True)
+class OwnApp:
+    """A ``Ctrl+K`` target that opens your own Todos (``todo``) or Notes (``notes``) pane."""
+
+    slug: str
+
+
+@dataclass(frozen=True)
 class JumpTarget:
-    """One entry of the ``Ctrl+K`` list: a label and the conversation it opens."""
+    """One entry of the ``Ctrl+K`` list: a label and what it opens, a conversation or one of
+    your own app panes."""
 
     label: str
-    conversation: Conversation
+    conversation: Conversation | OwnApp
 
 
 def jump_targets(rooms: list[GroupSummary]) -> list[JumpTarget]:
-    """Pepper, every room (opens its newest topic) and every live topic, in sidebar order."""
-    targets = [JumpTarget("Pepper", PEPPER)]
+    """Your own Todos and Notes, Pepper, every room (opens its newest topic) and every live
+    topic, in sidebar order. A room's own copy is not listed: its shelf is read lazily."""
+    targets = [JumpTarget(title, OwnApp(slug)) for slug, title in APP_TITLES.items()]
+    targets.append(JumpTarget("Pepper", PEPPER))
     for room in rooms:
         topics = topics_by_recency(room)
         if topics:
@@ -1071,6 +1140,10 @@ def fuzzy_filter(query: str, targets: Sequence[JumpTarget]) -> list[JumpTarget]:
 APP_TITLES = {"todo": "Todos", "notes": "Notes"}
 #: Notes asked of ``GET /api/v1/artifacts`` (the route's cap), and the "Showing N" row's number.
 NOTES_LIMIT = 200
+#: The rule between your own Todos and Notes rows and Pepper: the web's "Messages" label.
+RULE = "─" * 24
+#: How many turns the reply strip holds: the exchange in flight and the one before it.
+STRIP_TURNS = 2
 #: What the closing line of a truncated notes list says, after the count.
 NOTES_TRUNCATED = "Showing {limit} notes. `pepper notes list` searches the rest."
 
@@ -1079,8 +1152,8 @@ NOTES_TRUNCATED = "Showing {limit} notes. `pepper notes list` searches the rest.
 class AppPaneState:
     """One open Todos or Notes pane: whose it is, what it last read, and where the cursor is.
 
-    ``owner`` is a room's id, or ``None`` for your own (the shape P1b reuses). The pane holds
-    the last good read, so a failed re-read leaves the list on screen with ``error`` set.
+    ``owner`` is a room's id, or ``None`` for your own. The pane holds the last good read, so a
+    failed re-read leaves the list on screen with ``error`` set.
     """
 
     owner: str | None
@@ -1088,6 +1161,10 @@ class AppPaneState:
     #: ``m``: only the todos someone asked of you.
     mine: bool = False
     todos: list[TodoEntry] | None = None
+    #: Your own Todos only: each of your rooms' items (``GET /todos/rooms``), once read.
+    rooms: list[RoomTodos] | None = None
+    #: Your own Todos only: the rooms' read failed, so the list shows your own items alone.
+    rooms_error: bool = False
     notes: list[ArtifactListItem] | None = None
     #: The notes list was cut at :data:`NOTES_LIMIT`.
     truncated: bool = False
@@ -1103,6 +1180,9 @@ class AppPaneState:
     #: The open note's last read failed. Kept apart from ``error``: the list is re-read behind
     #: an open note, and its success must not clear the note's failure.
     note_error: str | None = None
+    #: Your own panes only: the turns sent from this pane, newest last, kept as
+    #: :func:`strip_turns` says for the reply strip. Dropped with the pane.
+    exchanges: list[DmTurn] = field(default_factory=list)
 
     @property
     def title(self) -> str:
@@ -1116,6 +1196,49 @@ class AppPaneState:
     @property
     def loaded(self) -> bool:
         return (self.todos if self.slug == "todo" else self.notes) is not None
+
+
+def pane_subject(pane: AppPaneState | None) -> tuple[str | None, dict[str, Any] | None]:
+    """What a turn sent under ``pane`` tells Pepper is on screen: ``("app:todo", None)``, or
+    over an open note ``("app:notes", {"note_id": ...})``. Nothing for a room's pane (it has no
+    composer) or no pane."""
+    if pane is None or pane.owner is not None:
+        return None, None
+    context = {"note_id": pane.note_id} if pane.slug == "notes" and pane.note_id else None
+    return f"app:{pane.slug}", context
+
+
+def pane_placeholder(pane: AppPaneState | None, default: str) -> str:
+    """The composer's placeholder: ``Ask Pepper about your todos…`` under your own pane."""
+    if pane is None or pane.owner is not None:
+        return default
+    return f"Ask Pepper about your {pane.title.lower()}…"
+
+
+def strip_turns(turns: Sequence[DmTurn]) -> list[DmTurn]:
+    """The turns the reply strip holds: the exchange in flight and the one before it (§6.9).
+
+    With every turn over, the last :data:`STRIP_TURNS`. Otherwise everything from the one
+    before the first unfinished turn, so sends queued behind a running turn never push its
+    answer out before it arrives; the strip narrows again as the queue drains.
+    """
+    first = next((i for i, turn in enumerate(turns) if turn.phase != "done"), None)
+    if first is None:
+        return list(turns[-STRIP_TURNS:])
+    return list(turns[max(0, first - 1) :])
+
+
+def remember_exchange(pane: AppPaneState, turn: DmTurn) -> None:
+    """Keep ``turn`` for the reply strip (see :func:`strip_turns`)."""
+    pane.exchanges = strip_turns([*pane.exchanges, turn])
+
+
+def own_app_row(slug: str) -> SidebarRow:
+    """The top-level Todos or Notes row. Its key is the key of your own pane, so the tree marks
+    it current while that pane is open."""
+    return SidebarRow(
+        key=f"app:me:{slug}", kind="own_app", label=APP_TITLES[slug], depth=0, slug=slug
+    )
 
 
 def pane_row(pane: AppPaneState) -> SidebarRow:
@@ -1152,6 +1275,25 @@ def todo_sections(entries: Sequence[TodoEntry]) -> tuple[list[TodoEntry], list[T
     opened.sort(key=lambda e: (*_due_key(e), _ts_or_epoch(e.created_at)))
     closed.sort(key=lambda e: _ts_or_epoch(e.done_at or e.created_at), reverse=True)
     return opened, closed
+
+
+def own_todo_sections(
+    entries: Sequence[TodoEntry], rooms: Sequence[RoomTodos]
+) -> tuple[list[TodoEntry], list[tuple[RoomTodos, list[TodoEntry]]], list[TodoEntry]]:
+    """``(your open, [(room, its open)], closed)`` for your own Todos, as ``todo.html`` draws it.
+
+    Your own open items come first, then a section per room that has an open item, in the
+    route's order (most recently active room first). Every closed item, yours and every
+    room's, is merged into the one Closed fold.
+    """
+    own_open, _ = todo_sections(entries)
+    sections = [(room, todo_sections(room.items)[0]) for room in rooms]
+    everything = [*entries, *(item for room in rooms for item in room.items)]
+    return (
+        own_open,
+        [(room, items) for room, items in sections if items],
+        (todo_sections(everything)[1]),
+    )
 
 
 def _person_name(person: Any, you_ids: AbstractSet[str]) -> str:
@@ -1207,9 +1349,13 @@ def edited_label(value: str | None, *, now: datetime) -> str:
     return day_label(local, now=here)
 
 
+_OWN_SOURCES = frozenset({"user", "request"})
+
+
 def todo_source_label(entry: TodoEntry) -> str:
-    """``from <producer>`` for a todo a producer made; nothing for one you typed."""
-    return f"from {entry.source}" if entry.source and entry.source != "user" else ""
+    """``from <producer>`` for a todo a producer made; nothing for one you typed. An ask
+    (``request``) says who asked on its own line, so it is not also "from request"."""
+    return f"from {entry.source}" if entry.source and entry.source not in _OWN_SOURCES else ""
 
 
 def todo_source_url(entry: TodoEntry, *, base: str) -> str | None:
@@ -1232,8 +1378,9 @@ def notes_order(items: Sequence[ArtifactListItem]) -> list[ArtifactListItem]:
 
 @dataclass(frozen=True)
 class PaneRow:
-    """One row of a pane's list. ``kind`` is ``todo``, ``fold`` ("Closed (N)"), ``note`` or
-    ``limit`` (the "Showing 200" line); the last is never selectable."""
+    """One row of a pane's list. ``kind`` is ``todo``, ``fold`` ("Closed (N)"), ``note``,
+    ``section`` (a room's heading on your own Todos) or ``limit`` (the "Showing 200" line);
+    the last two are never selectable."""
 
     key: str
     kind: str
@@ -1241,18 +1388,25 @@ class PaneRow:
     note: ArtifactListItem | None = None
     #: A ``fold`` row's closed count.
     count: int = 0
+    #: A ``section`` row's room name.
+    label: str = ""
 
     @property
     def selectable(self) -> bool:
-        return self.kind != "limit"
+        return self.kind not in ("limit", "section")
 
 
 def pane_rows(pane: AppPaneState) -> list[PaneRow]:
     """The pane's list as flat rows: open todos, the Closed fold (and its todos once unfolded),
     or the notes with the truncation line last."""
     if pane.slug == "todo":
-        opened, closed = todo_sections(pane.todos or [])
+        opened, sections, closed = own_todo_sections(
+            pane.todos or [], (pane.rooms or []) if pane.owner is None else []
+        )
         rows = [PaneRow(f"todo:{e.id}", "todo", todo=e) for e in opened]
+        for room, items in sections:
+            rows.append(PaneRow(f"section:{room.group_id}", "section", label=room.name))
+            rows.extend(PaneRow(f"todo:{e.id}", "todo", todo=e) for e in items)
         if closed:
             rows.append(PaneRow("fold", "fold", count=len(closed)))
             if pane.closed_open:
@@ -1265,7 +1419,8 @@ def pane_rows(pane: AppPaneState) -> list[PaneRow]:
 
 
 def open_todo_count(pane: AppPaneState) -> int:
-    return len(todo_sections(pane.todos or [])[0])
+    """The "N open" count: your own open items and, on your own Todos, your rooms' too."""
+    return sum(1 for row in pane_rows(pane) if row.todo is not None and row.todo.status == "open")
 
 
 def move_selection(rows: Sequence[PaneRow], selected: str | None, step: int) -> str | None:
