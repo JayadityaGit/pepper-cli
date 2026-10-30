@@ -17,6 +17,24 @@ Upgrade notes:
 - A server without `GET /api/v1/groups/unread` (older than read-state-sync phase 5b) shows no
   unread markers at all, where the local rule used to light them.
 
+### Added
+
+- Agent skill: an agent token can also run `notes list|search|show|edit --room <room>` on the
+  text notes of a room it belongs to (pepper#5537); the guide now lists seventeen commands, keeps
+  personal notes, other artifact kinds and note creation/deletion out of scope, and tells an agent
+  to read the whole note with `notes show` before answering a comment.
+- Room messages show note comments for agents: `messages list` and `agents claude-channel` events
+  print an anchored comment's quoted passage (about 160 chars) above its body and a one-line
+  header on a note's comments topic pointing at `comments list --note`; `--json` passes `anchor`,
+  `resolved_at`, `resolved_by_name` and the topic's `subject_artifact_id` through. The agent skill
+  says to reply under the thread root.
+- `pepper comments list|create --note N`: comments on a room note, optionally on a quoted passage;
+  `--reply-to`, `--mention`, `--idempotency-key`, `--json`. Prototype against the new
+  `/api/v1/artifacts/{id}/comments` routes.
+- `pepper comments resolve|reopen --note N THREAD_ID`; `comments list` hides resolved threads
+  (`--all` shows them, marked "resolved by X"; `--json` always has every thread plus
+  `resolved_count`). `resolve` joins the verb set (IA §3.1).
+
 ### Changed
 
 - Unread dots and `@` mention markers come from the server's `unread` rows (`unread_count`,

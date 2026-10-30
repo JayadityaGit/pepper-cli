@@ -42,6 +42,7 @@ from rich.markup import escape
 from rich.segment import Segment
 from rich.text import Text
 
+from pepper_cli import credentials
 from pepper_cli.terminal_text import sanitize_line, sanitize_text
 
 if TYPE_CHECKING:
@@ -52,6 +53,7 @@ if TYPE_CHECKING:
         GroupMessagePage,
         GroupRosterMember,
         GroupTopicSummary,
+        NoteComments,
         ScheduledTaskDetail,
         ScheduledTaskMessage,
         ScheduledTaskRunEntry,
@@ -897,6 +899,44 @@ def render_group_detail(detail: dict[str, Any]) -> None:
             _stdout.print("apps: (none installed)")
 
 
+def render_note_comments(result: NoteComments, *, show_resolved: bool = False) -> None:
+    """Pretty-print ``pepper comments list``: per thread the quote (or "whole note"), a
+    ``detached`` marker when the quote no longer appears in the note, then author, time and
+    body, with replies indented beneath. Resolved threads are hidden unless ``show_resolved``
+    (a display filter only), with a footer counting what was hidden; shown, they carry a
+    "resolved by X" marker."""
+    threads = [t for t in result.threads if show_resolved or not t.message.resolved_at]
+    hidden = len(result.threads) - len(threads)
+    if not threads:
+        _stdout.print("(no comments)" if not hidden else "(no open comments)")
+    for i, thread in enumerate(threads):
+        if i:
+            _stdout.print("")
+        anchor = thread.message.anchor
+        quote = str(anchor.get("exact") or "") if anchor else ""
+        head = f"[bold]\u201c{_s(quote)}\u201d[/bold]" if quote else "[bold]whole note[/bold]"
+        if thread.detached:
+            head += "  [yellow]detached[/yellow]"
+        if thread.message.resolved_at:
+            by = f" by {_s(thread.message.resolved_by)}" if thread.message.resolved_by else ""
+            head += f"  [green]resolved{by}[/green]"
+        _stdout.print(head, soft_wrap=True)
+        for depth, msg in enumerate([thread.message, *thread.replies]):
+            pad = "  " if depth else ""
+            _stdout.print(
+                f"{pad}  [cyan]{_s(msg.author)}[/cyan]  "
+                f"[dim]{_s(_format_stamp(msg.created_at))}  {_s(msg.id)}[/dim]",
+                soft_wrap=True,
+            )
+            if msg.deleted:
+                _stdout.print(f"{pad}  [dim](deleted)[/dim]", soft_wrap=True)
+                continue
+            for line in sanitize_text(msg.body).splitlines() or [""]:
+                _stdout.print(f"{pad}  {escape(line)}", soft_wrap=True)
+    if hidden and not show_resolved:
+        _stdout.print(f"\n{hidden} resolved hidden \u2014 use --all", soft_wrap=True)
+
+
 def render_note_list(result: ArtifactListResponse) -> None:
     """Pretty-print a ``pepper notes list``/``search`` page to stdout.
 
@@ -949,7 +989,30 @@ def group_message_tags(m: GroupMessage) -> tuple[str, str]:
     return via, agent
 
 
-def render_group_messages(page: GroupMessagePage) -> None:
+ANCHOR_QUOTE_CAP = 160
+
+
+def note_topic_header(note_id: str) -> str:
+    """One line naming a note's comment topic and how to read it as threads."""
+    return (
+        f"[note comments] This is the comments topic of note {sanitize_line(note_id)}; "
+        f"read it as threads with: {credentials.command_prefix()} comments list "
+        f"--note {sanitize_line(note_id)}"
+    )
+
+
+def anchor_quote_line(anchor: dict[str, Any] | None) -> str:
+    """``> "quoted passage"`` for an anchored comment (truncated), else ``""``."""
+    exact = anchor.get("exact") if isinstance(anchor, dict) else None
+    if not isinstance(exact, str) or not exact.strip():
+        return ""
+    text = " ".join(sanitize_text(exact).split())
+    if len(text) > ANCHOR_QUOTE_CAP:
+        text = text[: ANCHOR_QUOTE_CAP - 1].rstrip() + "…"
+    return f'> "{text}"'
+
+
+def render_group_messages(page: GroupMessagePage, note_id: str | None = None) -> None:
     """Pretty-print one page of a topic's messages to stdout, oldest first.
 
     Timestamps use ``created_at_display`` verbatim — server-preformatted in
@@ -977,6 +1040,8 @@ def render_group_messages(page: GroupMessagePage) -> None:
     than opening a blank one (the same guard as the web room's
     ``group_room.js``).
     """
+    if note_id:
+        _stdout.print(note_topic_header(note_id), markup=False, highlight=False, soft_wrap=True)
     if not page.messages:
         _stdout.print("(no messages)")
     last_day_key: str | None = None
@@ -1003,6 +1068,12 @@ def render_group_messages(page: GroupMessagePage) -> None:
         _stdout.print(
             f"[dim]{_s(m.created_at_display)}[/dim] [bold]{display_name}[/bold]{via}{edited}:"
         )
+        quoted = anchor_quote_line(m.anchor)
+        if quoted:
+            _stdout.print(quoted, markup=False, highlight=False, soft_wrap=True)
+        if m.resolved_at:
+            by = f" by {m.resolved_by_name}" if m.resolved_by_name else ""
+            _stdout.print(f"(resolved{by})", markup=False, highlight=False)
         if m.is_broken:
             _stdout.print("[dim](message could not be rendered)[/dim]")
         else:

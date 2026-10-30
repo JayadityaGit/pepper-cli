@@ -46,7 +46,7 @@ from mcp.server.runner import serve_loop
 from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
 
-from pepper_cli import api_client, render
+from pepper_cli import api_client, credentials, render
 from pepper_cli._version import get_version
 from pepper_cli.cli import (
     _WATCH_BACKOFF_CAP,
@@ -197,6 +197,8 @@ class TopicInfo:
     room_id: str
     room_name: str
     topic_name: str
+    #: The note's id when this is a note's comment topic.
+    subject_artifact_id: str | None = None
 
 
 TopicMap = dict[str, TopicInfo]
@@ -230,7 +232,9 @@ def build_topic_map(api: api_client.ApiClient, groups: api_client.GroupList) -> 
     mapping: TopicMap = {}
     for room in groups.groups:
         for topic in api.list_group_topics(room.group_id):
-            mapping[topic.topic_id] = TopicInfo(room.group_id, room.display_name, topic.name)
+            mapping[topic.topic_id] = TopicInfo(
+                room.group_id, room.display_name, topic.name, topic.subject_artifact_id
+            )
     return mapping
 
 
@@ -287,9 +291,24 @@ def message_event(
         if not meta["created_at"]:
             del meta["created_at"]
         return content, meta
+    preface = ""
+    if info.subject_artifact_id:
+        note = sanitize_line(info.subject_artifact_id)
+        preface += (
+            f"[comments topic of note {note}; read it with "
+            f"`{credentials.command_prefix()} comments list --note {note} --room {info.room_id}`; "
+            "reply under the thread root, never top-level]\n"
+        )
+    if row.anchor and isinstance(row.anchor.get("exact"), str):
+        quoted = " ".join(sanitize_line(row.anchor["exact"]).split())
+        if len(quoted) > 160:
+            quoted = quoted[:159].rstrip() + "…"
+        preface += f'> on the passage: "{quoted}"\n'
     content, truncated = clip_content(
-        f"{sanitize_line(row.display_name)} in {where}:\n{row.raw_body}"
+        f"{sanitize_line(row.display_name)} in {where}:\n{preface}{row.raw_body}"
     )
+    if info.subject_artifact_id:
+        meta["note_id"] = info.subject_artifact_id
     if row.parent_message_id:
         meta["parent_id"] = row.parent_message_id
     if row.author_person_id:

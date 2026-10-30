@@ -52,6 +52,8 @@ NOUNS = frozenset(
         "scheduled-tasks",
         "skills",
         "notes",
+        # `comments` is the thread of remarks on a room note, always inside one (--note).
+        "comments",
         # `research-projects` and `research-items` are the product's words "Research projects"
         # and their ledger (planning/research-projects.md §2).
         "research-projects",
@@ -113,6 +115,8 @@ VERBS = frozenset(
         "done",
         "dismiss",
         "reopen",
+        # `resolve`/`reopen THREAD` close and reopen a comment thread (IA §3.1).
+        "resolve",
         "download",
         "run",
         # `runs OBJECT` is the run history of an object that runs (IA §3.1).
@@ -395,7 +399,7 @@ def test_room_is_a_flag_where_it_means_something() -> None:
 
 
 #: Nouns whose leaves each take a required container flag (IA §3 rule 2).
-CONTAINER = {"research-items": "--project"}
+CONTAINER = {"research-items": "--project", "comments": "--note"}
 
 
 def test_room_comes_before_the_container_flag() -> None:
@@ -635,6 +639,20 @@ _RESEARCH_DETAIL = {
 }
 
 #: path -> body for every GET the leaves below make (query strings are ignored).
+_COMMENT_THREAD = {
+    "message": {
+        "id": "m1",
+        "body": "hi",
+        "author": {"id": "p1", "display_name": "Ada", "is_agent": False},
+        "created_at": "2026-10-26T10:00:00Z",
+        "resolved_at": "2026-10-26T11:00:00Z",
+        "resolved_by": {"id": "p1", "display_name": "Ada", "is_agent": False},
+    },
+    "position": None,
+    "detached": False,
+    "replies": [],
+}
+
 ROUTES: dict[str, object] = {
     "/api/v1/whoami": {"user_id": "u", "display_name": "U", "timezone": "UTC"},
     f"/api/v1/trajectories/{_TRAJ}": {
@@ -844,6 +862,14 @@ ROUTES: dict[str, object] = {
         "workout": {"at": "07:00", "minutes": 45},
     },
     f"/api/v1/artifacts/{_NOTE}/detail": {**_NOTE_ROW, "shared": False, "body": "hello note"},
+    f"/api/v1/artifacts/{_NOTE}/comments": {
+        "artifact_id": _NOTE,
+        "group_id": _G,
+        "topic_id": None,
+        "etag": "e1",
+        "threads": [],
+        "resolved_count": 0,
+    },
 }
 
 #: Non-GET routes (POST, DELETE): the room post answers ``{"message": {...}}``.
@@ -889,6 +915,13 @@ POST_ROUTES: dict[str, object] = {
     "/api/v1/artifacts/new": {"id": _NOTE, "name": "Runbook", "etag": "e1"},
     f"/api/v1/artifacts/{_NOTE}/edit": {
         "artifact": {**_NOTE_ROW, "shared": False, "body": "changed"}
+    },
+    f"/api/v1/artifacts/{_NOTE}/comments/m1/resolve": {"thread": _COMMENT_THREAD},
+    f"/api/v1/artifacts/{_NOTE}/comments/m1/reopen": {"thread": _COMMENT_THREAD},
+    f"/api/v1/artifacts/{_NOTE}/comments": {
+        "thread_root_id": "m1",
+        "topic_id": "t1",
+        "message": {"id": "m1", "body": "hi"},
     },
     "/api/v1/apps/notes/actions/delete": {"result": {"name": "Runbook"}},
     "/api/v1/apps/artifacts/actions/delete": {"result": {"name": "Receipt"}},
@@ -1090,6 +1123,10 @@ JSON_CASES: dict[str, list[str]] = {
     "notes create": ["notes", "create", "Runbook", "--file", "body.md"],
     "notes edit": ["notes", "edit", _NOTE, "--file", "body.md"],
     "notes delete": ["notes", "delete", _NOTE, "--yes"],
+    "comments list": ["comments", "list", "--note", _NOTE],
+    "comments resolve": ["comments", "resolve", "--note", _NOTE, "m1"],
+    "comments reopen": ["comments", "reopen", "--note", _NOTE, "m1"],
+    "comments create": ["comments", "create", "--note", _NOTE, "--quote", "hello", "Nice"],
     "artifacts list": ["artifacts", "list", "--kind", "file"],
     "artifacts show": ["artifacts", "show", _BLOB],
     "artifacts download": ["artifacts", "download", _BLOB, "--out", "got.png", "--force"],

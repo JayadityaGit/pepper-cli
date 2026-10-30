@@ -45,7 +45,19 @@ _SHELL_END = re.compile(r"^(\||&&|;|\d*>|<<?-?)")
 _PLACEHOLDER = re.compile(r"^<[^<>\s]*>$")
 # Commands the document always shows under a profile; ``agent-skill`` and ``--version``
 # need no login, so the document may show them bare.
-_API_NOUNS = frozenset({"rooms", "topics", "messages", "attachments", "members", "sharing", "apps"})
+_API_NOUNS = frozenset(
+    {
+        "rooms",
+        "topics",
+        "messages",
+        "attachments",
+        "members",
+        "sharing",
+        "apps",
+        "comments",
+        "notes",
+    }
+)
 _NEEDS_PROFILE = _API_NOUNS | {"login", "logout", "whoami"}
 _HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
 
@@ -74,6 +86,14 @@ _AGENT_COMMANDS = frozenset(
         "messages unreact",
         "members list",
         "attachments download",
+        "comments list",
+        "comments create",
+        "comments resolve",
+        "comments reopen",
+        "notes list",
+        "notes search",
+        "notes show",
+        "notes edit",
     }
 )
 _AGENT_REFUSED_FLAGS = frozenset({"--mark", "--attach"})
@@ -347,6 +367,8 @@ def test_document_names_the_tempting_commands_as_unavailable() -> None:
         "messages edit",
         "messages delete",
         "rooms show",
+        "notes create",
+        "notes delete",
     ):
         assert f"`pepper --profile <name> {needle}`" in cannot, needle
     for flag in _AGENT_REFUSED_FLAGS:

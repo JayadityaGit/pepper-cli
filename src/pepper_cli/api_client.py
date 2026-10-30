@@ -43,6 +43,10 @@ from pepper_cli.terminal_text import CONTROL_CHAR_RE, sanitize_text, strip_seque
 #: Ordinary API request timeout (seconds). Chat streams may have long gaps
 #: between frames while the agent works, so they get a separate read limit.
 DEFAULT_TIMEOUT = 60.0
+
+#: An agent member's token. It authenticates as the agent, not a Pepper account, so it reaches
+#: only the room routes (and a room's notes, named with ``?principal=``).
+AGENT_TOKEN_PREFIX = "pep_agt_"
 DEFAULT_CHAT_STREAM_READ_TIMEOUT = 600.0
 #: Longest the agent event stream may go without a byte before the read is
 #: abandoned and the caller reconnects. The server sends a ``: ping`` comment
@@ -1241,6 +1245,8 @@ class GroupTopicSummary:
     #: lands in. Only the topic rail
     #: (``GET .../topics``) says so; the rooms list leaves it ``False``.
     is_default: bool = False
+    #: The note's id when this is a note's comment topic; ``None`` otherwise.
+    subject_artifact_id: str | None = None
 
 
 # MIRROR: src/pepper/api/groups.py::list_groups
@@ -1436,6 +1442,12 @@ class GroupMessage:
     #: from an older server.
     is_agent: bool = False
     for_display_name: str | None = None
+    #: Note comments: the quoted passage a thread root is anchored to
+    #: (``{exact, prefix, suffix, etag}``), and when/by whom the thread was
+    #: resolved. ``None`` on ordinary messages and on rows from an older server.
+    anchor: dict[str, Any] | None = None
+    resolved_at: str | None = None
+    resolved_by_name: str | None = None
 
 
 # MIRROR: src/pepper/api/groups.py::topic_messages
@@ -1561,6 +1573,9 @@ def group_message_from_dict(row: dict[str, Any]) -> GroupMessage:
         is_agent=bool(row.get("is_agent", False)),
         for_display_name=row.get("for_display_name"),
         parent_message_id=row.get("parent_message_id"),
+        anchor=row.get("anchor") if isinstance(row.get("anchor"), dict) else None,
+        resolved_at=row.get("resolved_at"),
+        resolved_by_name=row.get("resolved_by_name"),
     )
 
 
@@ -1596,6 +1611,7 @@ def _group_topic_from_dict(row: dict[str, Any]) -> GroupTopicSummary:
         archived_at=row.get("archived_at"),
         imported_history=row.get("imported_history", False),
         is_default=row.get("is_default", False),
+        subject_artifact_id=row.get("subject_artifact_id"),
     )
 
 
@@ -1645,6 +1661,90 @@ class ArtifactListResponse:
 
     truncated: bool
     items: list[ArtifactListItem] = field(default_factory=list)
+
+
+# The note-comment routes answer untyped JSON the server has not published in the vendored
+# snapshot yet, so these carry no contract marker; add one once the snapshot refresh lands.
+# They follow the prototype contract (GET/POST /api/v1/artifacts/{id}/comments, and
+# POST .../{thread_id}/resolve|reopen).
+@dataclass(frozen=True)
+class NoteComment:
+    """One message of a note-comment thread (a root or a reply)."""
+
+    id: str
+    body: str
+    author: str
+    created_at: str
+    mentions: list[str] = field(default_factory=list)
+    anchor: dict[str, Any] | None = None
+    resolved_at: str | None = None
+    resolved_by: str | None = None
+    deleted: bool = False
+
+
+@dataclass(frozen=True)
+class NoteCommentThread:
+    """A thread: its root message, where the quote sits now, and its replies."""
+
+    message: NoteComment
+    position: dict[str, int] | None
+    detached: bool
+    replies: list[NoteComment] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class NoteComments:
+    """``GET /api/v1/artifacts/{id}/comments``."""
+
+    artifact_id: str
+    group_id: str | None
+    topic_id: str | None
+    etag: str | None
+    threads: list[NoteCommentThread] = field(default_factory=list)
+    resolved_count: int = 0
+
+
+def _note_comment_from_dict(row: dict[str, Any]) -> NoteComment:
+    anchor = row.get("anchor")
+    resolver = row.get("resolved_by")
+    return NoteComment(
+        id=str(row["id"]),
+        body=str(row.get("body") or ""),
+        author=str((row.get("author") or {}).get("display_name") or ""),
+        created_at=str(row.get("created_at") or ""),
+        mentions=_mention_ids(
+            [
+                {"person_id": m["id"]} if isinstance(m, dict) and "id" in m else m
+                for m in row.get("mentions") or []
+            ]
+        ),
+        anchor=anchor if isinstance(anchor, dict) else None,
+        resolved_at=row.get("resolved_at"),
+        resolved_by=str(resolver.get("display_name") or "") if isinstance(resolver, dict) else None,
+        deleted=row.get("deleted") is True,
+    )
+
+
+def _note_thread_from_dict(t: dict[str, Any]) -> NoteCommentThread:
+    position = t.get("position")
+    return NoteCommentThread(
+        message=_note_comment_from_dict(t["message"]),
+        position=position if isinstance(position, dict) else None,
+        detached=bool(t.get("detached", False)),
+        replies=[_note_comment_from_dict(r) for r in t.get("replies") or []],
+    )
+
+
+def _note_comments_from_dict(body: dict[str, Any]) -> NoteComments:
+    threads = [_note_thread_from_dict(t) for t in body.get("threads") or []]
+    return NoteComments(
+        artifact_id=str(body.get("artifact_id") or ""),
+        group_id=body.get("group_id"),
+        topic_id=body.get("topic_id"),
+        etag=body.get("etag"),
+        threads=threads,
+        resolved_count=int(body.get("resolved_count") or 0),
+    )
 
 
 # MIRROR: src/pepper/agent/artifacts/applet.py::read_detail
@@ -1775,6 +1875,12 @@ class ApiClient:
         """The server's base URL, without a trailing slash (a client resolves the
         server-relative links a message carries against it)."""
         return self._server_url
+
+    @property
+    def is_agent_token(self) -> bool:
+        """Whether this client authenticates as a room's agent member (a ``pep_agt_`` token),
+        which the server lets list notes only of a room it names."""
+        return self._token.get_secret_value().startswith(AGENT_TOKEN_PREFIX)
 
     def __enter__(self) -> Self:
         return self
@@ -3564,6 +3670,61 @@ class ApiClient:
         """
         body = self._request("GET", f"/api/v1/artifacts/{artifact_id}/detail").json()
         return _artifact_detail_from_dict(body)
+
+    def list_note_comments(self, artifact_id: str) -> NoteComments:
+        """``GET /api/v1/artifacts/{id}/comments`` — a note's comment threads, oldest first."""
+        body = self._request("GET", f"/api/v1/artifacts/{artifact_id}/comments").json()
+        if not isinstance(body, dict):
+            raise ApiError(status=200, body=str(body), detail="malformed response")
+        return _note_comments_from_dict(body)
+
+    def create_note_comment(
+        self,
+        artifact_id: str,
+        *,
+        body: str,
+        quote: str | None = None,
+        reply_to: str | None = None,
+        mentions: list[str] | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """``POST /api/v1/artifacts/{id}/comments`` — comment on a quote, the whole note, or
+        reply to a thread. The server finds the quote and builds the anchor; the answer
+        (``thread_root_id``, ``message``, ``topic_id``) is returned as the server's own dict."""
+        payload: dict[str, Any] = {"body": body, "quote": quote, "start": None}
+        payload["reply_to"] = reply_to
+        payload["mentions"] = mentions or []
+        if idempotency_key:
+            payload["idempotency_key"] = idempotency_key
+        headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        resp = self._request(
+            "POST",
+            f"/api/v1/artifacts/{artifact_id}/comments",
+            json=payload,
+            extra_headers=headers,
+        ).json()
+        if not isinstance(resp, dict):
+            raise ApiError(status=200, body=str(resp), detail="malformed response")
+        return resp
+
+    def _set_note_thread_resolved(
+        self, artifact_id: str, thread_id: str, action: str
+    ) -> NoteCommentThread:
+        resp = self._request(
+            "POST", f"/api/v1/artifacts/{artifact_id}/comments/{thread_id}/{action}"
+        ).json()
+        thread = resp.get("thread") if isinstance(resp, dict) else None
+        if not isinstance(thread, dict):
+            raise ApiError(status=200, body=str(resp), detail="malformed response")
+        return _note_thread_from_dict(thread)
+
+    def resolve_note_thread(self, artifact_id: str, thread_id: str) -> NoteCommentThread:
+        """``POST /api/v1/artifacts/{id}/comments/{thread_id}/resolve`` (idempotent)."""
+        return self._set_note_thread_resolved(artifact_id, thread_id, "resolve")
+
+    def reopen_note_thread(self, artifact_id: str, thread_id: str) -> NoteCommentThread:
+        """``POST /api/v1/artifacts/{id}/comments/{thread_id}/reopen`` (idempotent)."""
+        return self._set_note_thread_resolved(artifact_id, thread_id, "reopen")
 
     def create_artifact(
         self,
